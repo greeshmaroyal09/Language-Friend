@@ -1,0 +1,50 @@
+# Environment files and local credentials (including examples at every level)
+.env*
+
+# Dependencies and generated builds
+node_modules/
+dist/
+dist-ssr/
+**/node_modules/
+**/dist/
+**/dist-ssr/
+.venv*/
+**/.venv*/
+
+# Python bytecode and test/runtime caches
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local logs and temporary recordings
+*.log
+logs/
+recordings/
+tmp/
+*.wav
+*.webm
+*.ogg
+*.recording.wav
+*.recording.webm
+/.verify-stage*/
+
+# Package-manager diagnostics
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Editor and operating-system files
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
