@@ -2,9 +2,11 @@ import { useNavigate } from "react-router-dom";
 import { useSettings, type Theme } from "./SettingsProvider";
 import { useState, useRef, useEffect } from "react";
 import { CHAT_LANGUAGES, SPOKEN_LANGUAGES } from "../languages";
+import { useChatHistory } from "../chatHistory";
 
-export default function Header() {
+export default function Header({ onNewHumanChat }: { onNewHumanChat: () => void }) {
   const navigate = useNavigate();
+  const { conversations, startNewConversation, openConversation, activeConversation } = useChatHistory();
   const { spokenLanguage, setSpokenLanguage, chatLanguage, setChatLanguage, theme, setTheme } = useSettings();
   const [showNewChatMenu, setShowNewChatMenu] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
@@ -28,7 +30,9 @@ export default function Header() {
 
   const startChat = (type: "ai" | "human") => {
     setShowNewChatMenu(false);
-    navigate(type === "ai" ? "/ai" : "/human");
+    if (type === "human") onNewHumanChat();
+    else startNewConversation();
+    navigate("/" + type);
   };
 
   return (
@@ -71,7 +75,7 @@ export default function Header() {
       <h1 className="app-title">Language Friend</h1>
 
       {/* Top Right: Settings */}
-      <div className="relative-container" ref={settingsRef}>
+      <div className="relative-container header-end" ref={settingsRef}>
         <button
           onClick={() => setShowSettings(!showSettings)}
           className="header-btn"
@@ -85,8 +89,20 @@ export default function Header() {
         {showSettings && (
           <div className="dropdown-panel right-panel">
             <div className="settings-section">
-              <span className="settings-label">Recent chats</span>
-              <div className="empty-state">No recent chats yet</div>
+              <span className="settings-label" id="history-label">History</span>
+              {conversations.length === 0 ? <div className="empty-state">No saved AI Bot chats yet</div> :
+                <ul className="chat-history" aria-labelledby="history-label">
+                  {conversations.map((entry) => <li key={entry.id}>
+                    <button type="button" className="dropdown-item" onClick={() => {
+                      if (!openConversation(entry.id)) return;
+                      setShowSettings(false);
+                      navigate("/ai");
+                    }}>
+                      <span>{entry.title}</span>
+                      <small>{new Date(entry.updatedAt).toLocaleString()}{activeConversation?.id === entry.id ? " · Last opened" : ""}</small>
+                    </button>
+                  </li>)}
+                </ul>}
             </div>
 
             <div className="settings-section">
@@ -126,6 +142,7 @@ export default function Header() {
               >
                 <option value="black-red">Black + Red</option>
                 <option value="black-lavender">Black + Lavender</option>
+                <option value="light">Light</option>
               </select>
             </div>
           </div>

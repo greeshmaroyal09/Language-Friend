@@ -1,96 +1,189 @@
 import { useEffect, useRef, useState } from "react";
 import { useSettings } from "./SettingsProvider";
-import { WavRecorder } from "../audio";
-import { PARTNER_LANGUAGES, getChatLanguage, getSpokenLanguage, type SpokenLanguage } from "../languages";
-import { isSpeechCancellation, playSpeech, stopSpeech } from "../speech";
+import { postChatForm, useChatRequests, useVoiceCapture } from "../chatRequests";
+import { PARTNER_LANGUAGES, getChatLanguage, getSpokenLanguage, typedLanguage, isRomanStyle, type ChatLanguage } from "../languages";
+import { SpeechButton } from "./SpeechButton";
 
 type Side = "owner" | "other";
-type TranslationLanguage = { value: string; tag: string };
-type TranslationRequest = {
-  message: string;
-  sourceLanguage: string;
-  sourceStyle: string;
-  targetLanguage: string;
-  targetStyle: string;
-  targetLabel: string;
-  targetSide: Side;
+type Language = Pick<ChatLanguage, "tag" | "value">;
+type Source = { text: string; language: string; style: string };
+type Capture = { language: string; style: string; speaker: Side; chat: Language; partner: Language };
+type Delivery = {
+  style: string;
+  language: string;
+  status: "pending" | "ready" | "failed";
+  text?: string;
+  speechText?: string;
 };
-type TranslationState = { request: TranslationRequest; status: "translating" | "failed"; error?: string };
-type Message = { id: string; side: Side; text: string; language: string; speechText?: string; label?: string; translation?: TranslationState };
+type Turn = { id: string; speaker: Side; source: Source; owner: Delivery; other?: Delivery };
+type HumanConversation = { partner: string | null; turns: Turn[]; capture?: Capture };
 
-function Bubble({ message, onRetryTranslation }: { message: Message; onRetryTranslation: (message: Message) => void }) {
-  const [error, setError] = useState(""); const [loading, setLoading] = useState(false);
-  const speak = async () => {
-    if (loading) return; setLoading(true); setError("");
-    try { await playSpeech(message.speechText ?? message.text, message.language); }
-    catch (cause) { if (!isSpeechCancellation(cause)) setError(cause instanceof Error ? cause.message : "Speech playback failed."); }
-    finally { setLoading(false); }
+function deliveryFor(source: Source, target: Language): Delivery {
+  const sameStyle = source.language === target.tag && source.style === target.value;
+  const needsSpeechScript = sameStyle && isRomanStyle(target.value) && /[a-z]/i.test(source.text);
+  return {
+    style: target.value,
+    language: target.tag,
+    status: sameStyle && !needsSpeechScript ? "ready" : "pending",
+    text: sameStyle ? source.text : undefined,
+    speechText: sameStyle && !needsSpeechScript ? source.text : undefined,
   };
-  const translation = message.translation;
-  return <div className={`chat-bubble ${message.side === "owner" ? "owner-bubble" : "other-bubble"}`}>
-    <span>{message.label && <small className="message-label">{message.label}</small>}{message.text}</span>
-    <button className="speaker-btn" type="button" disabled={loading} onClick={() => void speak()} aria-label={error ? `Retry audio: ${message.text}` : `Play audio: ${message.text}`}>{loading ? "Loading…" : error ? "Retry audio" : "🔊"}</button>
-    {translation && <div className="translation-retry" role="status">
-      <span>{translation.status === "translating" ? "Translating…" : translation.error || "Translation unavailable."}</span>
-      <button type="button" disabled={translation.status === "translating"} onClick={() => onRetryTranslation(message)}>{translation.status === "translating" ? "Translating…" : "Retry translation"}</button>
-    </div>}
-    {error && <span className="voice-unavailable" role="status">{error}</span>}
-  </div>;
+}
+
+function Bubble({ side, delivery }: { side: Side; delivery: Delivery }) {
+  if (!delivery.text) return null;
+  return (
+    <div className={"chat-bubble " + side + "-bubble"} data-style={delivery.style} lang={delivery.language}>
+      <span>{delivery.text}</span>
+      {delivery.speechText && <SpeechButton text={delivery.text} speechText={delivery.speechText} language={delivery.language} />}
+    </div>
+  );
 }
 
 export default function HumanChat() {
-  const { spokenLanguage, chatLanguage } = useSettings(); const spoken = getSpokenLanguage(spokenLanguage); const chat = getChatLanguage(chatLanguage);
-  const [partner, setPartner] = useState<SpokenLanguage | null>(null); const [open, setOpen] = useState(false); const [recording, setRecording] = useState<Side | null>(null);
-  const [status, setStatus] = useState(""); const [error, setError] = useState(""); const [messages, setMessages] = useState<Message[]>([]);
-  const [typing, setTyping] = useState<Side | null>(null); const [draft, setDraft] = useState(""); const recorder = useRef<WavRecorder | null>(null); const menu = useRef<HTMLDivElement>(null); const translating = useRef(new Set<string>());
-  useEffect(() => { const close = (event: MouseEvent) => { if (menu.current && !menu.current.contains(event.target as Node)) setOpen(false); }; document.addEventListener("mousedown", close); return () => document.removeEventListener("mousedown", close); }, []);
-  useEffect(() => () => { recorder.current?.dispose(); translating.current.clear(); stopSpeech(); }, []);
-  const translationRequest = (message: string, source: TranslationLanguage, target: TranslationLanguage, speaker: Side): TranslationRequest => ({ message, sourceLanguage: source.tag, sourceStyle: source.value, targetLanguage: target.tag, targetStyle: target.value, targetLabel: target.value, targetSide: speaker === "owner" ? "other" : "owner" });
-  const translate = async (messageId: string, request: TranslationRequest) => {
-    if (translating.current.has(messageId)) return;
-    translating.current.add(messageId); setStatus("Translating…"); setError("");
-    setMessages((current) => current.map((message) => message.id === messageId ? { ...message, translation: { request, status: "translating" } } : message));
-    try {
-      const body = new FormData(); body.append("message", request.message); body.append("source_language", request.sourceLanguage); body.append("source_style", request.sourceStyle); body.append("target_language", request.targetLanguage); body.append("target_style", request.targetStyle);
-      const response = await fetch("/api/conversations/text", { method: "POST", body }); const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data.detail || "Message translation failed.");
-      const translated = data.translation as string; const speechText = (data.speech_text as string | undefined) || translated;
-      if (!translated?.trim()) throw new Error("Message translation returned no text.");
-      setMessages((current) => {
-        if (!current.some((message) => message.id === messageId)) return current;
-        return [...current.map((message) => message.id === messageId ? { ...message, translation: undefined } : message), { id: crypto.randomUUID(), side: request.targetSide, text: translated, speechText, language: request.targetLanguage, label: request.targetLabel }];
-      });
-    } catch (cause) {
-      const detail = cause instanceof Error ? cause.message : "Message translation failed.";
-      setMessages((current) => current.map((message) => message.id === messageId ? { ...message, translation: { request, status: "failed", error: detail } } : message));
-    } finally {
-      translating.current.delete(messageId); setStatus("");
-    }
+  const { spokenLanguage, chatLanguage } = useSettings();
+  const { run, inFlight } = useChatRequests();
+  const [{ partner: partnerValue, turns, capture: interrupted }, updateConversation] = useState<HumanConversation>({
+    partner: null,
+    turns: [],
+  });
+  const spoken = getSpokenLanguage(spokenLanguage);
+  const chat = getChatLanguage(chatLanguage);
+  const partner = PARTNER_LANGUAGES.find((language) => language.value === partnerValue);
+  const [open, setOpen] = useState(false);
+  const [typing, setTyping] = useState<Side | null>(null);
+  const [draft, setDraft] = useState("");
+  const menu = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const close = (event: MouseEvent) => {
+      if (!menu.current?.contains(event.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", close);
+    return () => document.removeEventListener("mousedown", close);
+  }, []);
+
+  function deliver(turn: Turn, side: Side) {
+    const target = turn[side];
+    if (!target || target.status === "ready") return;
+    void run(turn.id + ":" + side, async (signal) => {
+      const save = (delivery: Delivery) => updateConversation((data) => ({
+        ...data,
+        turns: data.turns.map((item) => item.id === turn.id ? { ...item, [side]: delivery } : item),
+      }));
+      save({ ...target, status: "pending" });
+      try {
+        const result = await postChatForm("/api/conversations/text", {
+          message: turn.source.text,
+          source_language: turn.source.language,
+          source_style: turn.source.style,
+          target_language: target.language,
+          target_style: target.style,
+        }, signal);
+        if (typeof result.translation !== "string" || !result.translation.trim() ||
+            typeof result.speech_text !== "string" || !result.speech_text.trim()) throw new Error("Translation returned no text.");
+        if (!signal.aborted) save({ ...target, status: "ready", text: target.text ?? result.translation, speechText: result.speech_text });
+      } catch {
+        if (!signal.aborted) save({ ...target, status: "failed" });
+      }
+    });
+  }
+
+  function addTurn(capture: Capture, text: string, fromMic: boolean) {
+    const source = { text, language: capture.language, style: capture.style };
+    const turn: Turn = {
+      id: crypto.randomUUID(), speaker: capture.speaker, source,
+      owner: deliveryFor(source, capture.chat),
+      other: capture.speaker === "owner" ? deliveryFor(source, capture.partner) : undefined,
+    };
+    updateConversation((data) => ({ ...data, turns: [...data.turns, turn], capture: fromMic ? undefined : data.capture }));
+    deliver(turn, "owner");
+    deliver(turn, "other");
+  }
+
+  const voice = useVoiceCapture<Capture>(
+    (capture) => updateConversation((data) => ({ ...data, capture })),
+    (capture, text) => {
+      const source = typedLanguage(text, getChatLanguage(capture.style));
+      addTurn({ ...capture, language: source.tag, style: source.value }, text, true);
+    },
+  );
+  const captureFor = (speaker: Side, source: Language, recipient: Language): Capture => ({
+    speaker, language: source.tag, style: source.value, chat, partner: recipient,
+  });
+  const mic = (side: Side) => {
+    if (voice.recording?.speaker === side) voice.stop();
+    else if (partner) voice.start(captureFor(side, side === "owner" ? spoken : partner, partner));
   };
-  const retryTranslation = (message: Message) => { if (message.translation?.status === "failed") void translate(message.id, message.translation.request); };
-  const submitAudio = async (speaker: Side, blob: Blob) => {
-    if (!partner) return; const source = speaker === "owner" ? spoken : partner; const target = speaker === "owner" ? partner : chat;
-    setStatus("Transcribing…");
-    try {
-      const body = new FormData(); body.append("audio", blob, "language-friend-recording.wav"); body.append("language", source.tag); const response = await fetch("/api/transcribe", { method: "POST", body }); const transcription = await response.json().catch(() => ({})); if (!response.ok) throw new Error(transcription.detail || "Transcription failed.");
-      const transcript = transcription.transcript as string; const messageId = crypto.randomUUID(); const request = translationRequest(transcript, source, target, speaker);
-      setMessages((current) => [...current, { id: messageId, side: speaker, text: transcript, language: source.tag, label: `${source.value} transcript` }]);
-      await translate(messageId, request);
-    } catch (cause) { setError(cause instanceof Error ? cause.message : "Conversation request failed."); } finally { setStatus(""); setRecording(null); }
+  const input = (side: Side) => typing === side && (
+    <form className="text-entry" onSubmit={(event) => {
+      event.preventDefault();
+      const text = draft.trim();
+      if (!text || !partner || voice.busy || voice.recording) return;
+      const source = typedLanguage(text, side === "owner" ? chat : partner);
+      addTurn(captureFor(side, source, partner), text, false);
+      setDraft("");
+      setTyping(null);
+    }}>
+      <input value={draft} onChange={(event) => setDraft(event.target.value)} autoFocus
+        aria-label={side === "owner" ? "Your message" : "Other person's message"}
+        placeholder={"Type in " + (side === "owner" ? chat.label : partner?.value ?? "their language")} />
+      <button type="submit" disabled={!draft.trim() || voice.busy || Boolean(voice.recording)}>Send</button>
+    </form>
+  );
+  const controls = (side: Side) => {
+    const language = side === "owner" ? spoken.value : partner?.value ?? "Other person";
+    const listening = voice.recording?.speaker === side;
+    return <div className="chat-controls">
+      <button className={"mic-button " + side + "-mic"} disabled={!partner || voice.busy || Boolean(voice.recording && !listening)}
+        onClick={() => mic(side)} aria-label={listening ? "Stop recording" : "Start recording in " + language}>
+        🎙 <span>{listening ? "Stop listening" : language + " mic"}</span>
+      </button>
+      <button className="keyboard-button" disabled={!partner || voice.busy || Boolean(voice.recording)}
+        onClick={() => { setTyping(typing === side ? null : side); setDraft(""); }}
+        aria-label={side === "owner" ? "Type your message" : "Type the other person's message"}>⌨</button>
+    </div>;
   };
-  const stop = async (speaker: Side) => { const active = recorder.current; if (!active) return; recorder.current = null; setStatus("Preparing audio…"); try { await submitAudio(speaker, await active.stop()); } catch (cause) { setRecording(null); setStatus(""); setError(cause instanceof Error ? `Audio conversion failed: ${cause.message}` : "Audio conversion failed. Please record again."); } };
-  const toggleRecording = async (speaker: Side) => { setError(""); if (recording) { if (recording === speaker) void stop(speaker); return; } if (!partner) return; const source = speaker === "owner" ? spoken : partner; try { const next = new WavRecorder(); await next.start(); recorder.current = next; setRecording(speaker); setStatus(`Listening in ${source.value}…`); } catch (cause) { setError(cause instanceof Error ? cause.message : "Microphone permission was denied or is unavailable."); } };
-  const submitText = async (speaker: Side) => {
-    const text = draft.trim(); if (!text || !partner) return; const source = speaker === "owner" ? chat : partner; const target = speaker === "owner" ? partner : chat; const messageId = crypto.randomUUID(); const request = translationRequest(text, source, target, speaker);
-    setMessages((current) => [...current, { id: messageId, side: speaker, text, language: source.tag, label: source.value }]); setDraft(""); setTyping(null);
-    await translate(messageId, request);
-  };
-  const input = (side: Side) => typing === side && <form className="text-entry" onSubmit={(event) => { event.preventDefault(); void submitText(side); }}><input value={draft} onChange={(event) => setDraft(event.target.value)} autoFocus aria-label={`${side === "owner" ? "Your" : "Other person's"} message`} placeholder={`Type in ${side === "owner" ? chat.label : partner?.value ?? "their language"}`} /><button type="submit" disabled={!draft.trim()}>Send</button></form>;
-  const controls = (side: Side) => <div className="chat-controls"><button className={`mic-button ${side === "owner" ? "owner-mic" : "other-mic"}`} disabled={!partner || (recording !== null && recording !== side)} onClick={() => recording === side ? void stop(side) : void toggleRecording(side)} aria-label={recording === side ? "Stop recording" : `Start recording in ${side === "owner" ? spoken.value : partner?.value ?? "the selected language"}`}>🎙 <span>{recording === side ? "Stop listening" : `${side === "owner" ? spoken.value : partner?.value ?? "Other person"} mic`}</span></button><button className="keyboard-button" disabled={!partner || recording !== null} onClick={() => { setTyping((current) => current === side ? null : side); setDraft(""); }} aria-label={`Type ${side === "owner" ? "your" : "the other person's"} message`}>⌨</button></div>;
-  const owner = messages.filter((item) => item.side === "owner"); const other = messages.filter((item) => item.side === "other");
-  return <main className="human-chat-container"><div className="diagonal-backdrop" aria-hidden="true"><div className="diagonal-other-area" /><div className="diagonal-owner-area" /></div>{(status || error) && <div className="voice-notice" role={error ? "alert" : "status"}>{error || status}</div>}
-    <section className="conversation-area other-person-area" aria-label="Other person's conversation area">{controls("other")}{input("other")}<div className="bubbles-container other-bubbles">{other.map((message) => <Bubble key={message.id} message={message} onRetryTranslation={retryTranslation} />)}</div></section>
-    <div className="center-lang-wrapper" ref={menu}><button className="lang-control" onClick={() => setOpen((value) => !value)} aria-label="Choose the other person's language" aria-haspopup="listbox" aria-expanded={open}><span>LANG{partner ? ` · ${partner.nativeLabel}` : ""}</span><svg className="lang-chevron" viewBox="0 0 12 8" aria-hidden="true"><path d="m1 1.5 5 5 5-5" /></svg></button>{open && <ul className="lang-dropdown-menu" role="listbox" aria-label="Other person's language">{PARTNER_LANGUAGES.map((language) => <li className="lang-menu-item" key={language.value}><button onClick={() => { setPartner(language); setOpen(false); setError(""); }} role="option" aria-selected={partner?.value === language.value}>{language.nativeLabel}</button></li>)}</ul>}</div>
-    <section className="conversation-area owner-area" aria-label="Your conversation area"><div className="bubbles-container owner-bubbles">{owner.map((message) => <Bubble key={message.id} message={message} onRetryTranslation={retryTranslation} />)}</div>{input("owner")}{controls("owner")}</section>
+  const voiceStatus = voice.error || voice.status || (voice.recording ? "Listening…" : "");
+
+  return <main className="human-chat-container">
+    <div className="diagonal-backdrop" aria-hidden="true"><div className="diagonal-other-area" /><div className="diagonal-owner-area" /></div>
+    {voiceStatus && <div className="voice-notice" role={voice.error ? "alert" : "status"}>{voiceStatus}</div>}
+    <section className="conversation-area other-person-area" aria-label="Other person's conversation area">
+      {controls("other")}{input("other")}
+      <div className="bubbles-container other-bubbles">{turns.map((turn) => turn.other && <Bubble key={turn.id} side="other" delivery={turn.other} />)}</div>
+    </section>
+    <div className="center-lang-wrapper" ref={menu}>
+      <button className="lang-control" onClick={() => setOpen(!open)} aria-label="Choose the other person's language" aria-haspopup="listbox" aria-expanded={open}>
+        <span>LANG{partner && " · " + partner.nativeLabel}</span>
+        <svg className="lang-chevron" viewBox="0 0 12 8" aria-hidden="true"><path d="m1 1.5 5 5 5-5" /></svg>
+      </button>
+      {open && <ul className="lang-dropdown-menu" role="listbox" aria-label="Other person's language">{PARTNER_LANGUAGES.map((language) => (
+        <li className="lang-menu-item" key={language.value}><button onClick={() => {
+          updateConversation((data) => ({ ...data, partner: language.value }));
+          setOpen(false);
+        }} role="option" aria-selected={partner?.value === language.value}>{language.nativeLabel}</button></li>
+      ))}</ul>}
+    </div>
+    <section className="conversation-area owner-area" aria-label="Your conversation area">
+      <div className="bubbles-container owner-bubbles">
+        {turns.map((turn) => {
+          const unfinished = (["owner", "other"] as const).filter((side) => turn[side] && turn[side].status !== "ready");
+          const retryable = unfinished.filter((side) => !inFlight.has(turn.id + ":" + side));
+          return <div className="human-turn" key={turn.id}>
+            <Bubble side="owner" delivery={turn.owner} />
+            {unfinished.length > 0 && <div className="translation-retry" role="status">
+              {retryable.length > 0 ? <><span>Translation unavailable.</span><button type="button"
+                onClick={() => retryable.forEach((side) => deliver(turn, side))}>Retry translation</button></> : "Translating…"}
+            </div>}
+          </div>;
+        })}
+        {interrupted && !voice.busy && !voice.recording && <div className="translation-retry" role="status">
+          <span>Recording needs to be captured again.</span>
+          <button type="button" onClick={() => voice.start(interrupted)}>Record again</button>
+        </div>}
+      </div>
+      {input("owner")}{controls("owner")}
+    </section>
   </main>;
 }

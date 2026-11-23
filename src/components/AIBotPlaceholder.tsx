@@ -1,81 +1,114 @@
-import { useEffect, useRef, useState } from "react";
-import { WavRecorder } from "../audio";
-import { getChatLanguage, getSpokenLanguage } from "../languages";
-import { isSpeechCancellation, playSpeech, stopSpeech } from "../speech";
 import { useSettings } from "./SettingsProvider";
+import { useChatHistory, type StoredConversation } from "../chatHistory";
+import { postChatForm, useChatRequests, useVoiceCapture } from "../chatRequests";
+import { getChatLanguage, getSpokenLanguage } from "../languages";
+import { SpeechButton } from "./SpeechButton";
 
-type BotHistoryMessage = { role: "user" | "bot"; text: string };
-type ReplyRequest = { message: string; style: string; speechLanguage: string; history: BotHistoryMessage[] };
-type ReplyState = { request: ReplyRequest; status: "replying" | "failed"; error?: string };
-type BotMessage = { id: string; role: "user" | "bot"; text: string; speechText?: string; language?: string; reply?: ReplyState };
-type BotStatus = "idle" | "recording" | "converting" | "transcribing" | "thinking";
+type HistoryMessage = { role: "user" | "bot"; text: string };
+type Capture = { language: string; sourceStyle: string; replyStyle: string; replyLanguage: string };
+type Reply = { text: string; speechText: string; language: string; style: string };
+type Turn = {
+  id: string;
+  source: { text: string; speechText: string; language: string; style: string };
+  request: { style: string; language: string; history: HistoryMessage[] };
+  status: "pending" | "ready" | "failed";
+  reply?: Reply;
+};
+type BotConversation = { turns: Turn[]; capture?: Capture };
 
-const statusText: Record<BotStatus, string> = { idle: "", recording: "Listening… tap again when finished", converting: "Preparing audio…", transcribing: "Transcribing your message…", thinking: "AI Bot is replying…" };
-
-function BotBubble({ message, fallbackLanguage, onRetryReply }: { message: BotMessage; fallbackLanguage: string; onRetryReply: (message: BotMessage) => void }) {
-  const [loading, setLoading] = useState(false); const [error, setError] = useState("");
-  const speak = async () => {
-    if (loading) return; setLoading(true); setError("");
-    try { await playSpeech(message.speechText ?? message.text, message.language ?? fallbackLanguage); }
-    catch (cause) { if (!isSpeechCancellation(cause)) setError(cause instanceof Error ? cause.message : "Speech playback failed."); }
-    finally { setLoading(false); }
-  };
-  return <div className={`ai-message ${message.role === "user" ? "ai-user-message" : "ai-bot-message"}`}>
-    <small>{message.role === "user" ? "You" : "AI Bot"}</small>{message.text}
-    {message.role === "bot" && <button className="speaker-btn ai-speaker-btn" type="button" disabled={loading} onClick={() => void speak()} aria-label={error ? `Retry audio: ${message.text}` : `Play audio: ${message.text}`}>{loading ? "Loading…" : error ? "Retry audio" : "🔊"}</button>}
-    {message.role === "user" && message.reply && <div className="translation-retry" role="status"><span>{message.reply.status === "replying" ? "AI Bot is replying…" : message.reply.error || "AI Bot could not reply."}</span><button type="button" disabled={message.reply.status === "replying"} onClick={() => onRetryReply(message)}>{message.reply.status === "replying" ? "Replying…" : "Retry reply"}</button></div>}
-    {error && <span className="voice-unavailable" role="status">{error}</span>}
-  </div>;
-}
-
-export default function AIBotPlaceholder() {
+export default function AIBotPlaceholder({ conversation }: { conversation: StoredConversation }) {
   const { spokenLanguage, chatLanguage } = useSettings();
-  const spoken = getSpokenLanguage(spokenLanguage); const chat = getChatLanguage(chatLanguage);
-  const [status, setStatus] = useState<BotStatus>("idle"); const [error, setError] = useState("");
-  const [messages, setMessages] = useState<BotMessage[]>([]); const recorder = useRef<WavRecorder | null>(null); const replying = useRef(new Set<string>());
-  useEffect(() => () => { recorder.current?.dispose(); replying.current.clear(); stopSpeech(); }, []);
+  const spoken = getSpokenLanguage(spokenLanguage);
+  const chat = getChatLanguage(chatLanguage);
+  const { updateConversation } = useChatHistory();
+  const { run, inFlight } = useChatRequests();
+  const { turns, capture: interrupted } = conversation.data as BotConversation;
+  const update = (fn: (data: BotConversation) => BotConversation) =>
+    updateConversation<BotConversation>(conversation.id, (previous) => {
+      const data = fn(previous);
+      const titleText = data.turns[0]?.source.text;
+      return { data, hasTurns: Boolean(titleText || data.capture), title: titleText ? "AI Bot — " + titleText.slice(0, 48) : "AI Bot" };
+    });
 
-  const requestReply = async (messageId: string, request: ReplyRequest) => {
-    if (replying.current.has(messageId)) return;
-    replying.current.add(messageId); setError(""); setStatus("thinking");
-    setMessages((current) => current.map((message) => message.id === messageId ? { ...message, reply: { request, status: "replying" } } : message));
-    try {
-      const replyBody = new FormData(); replyBody.append("message", request.message); replyBody.append("style", request.style); replyBody.append("history", JSON.stringify(request.history));
-      const replyResponse = await fetch("/api/bot/reply", { method: "POST", body: replyBody }); const reply = await replyResponse.json().catch(() => ({}));
-      if (!replyResponse.ok) throw new Error(reply.detail || "AI Bot could not reply. Retry reply.");
-      if (!reply.reply?.trim()) throw new Error("AI Bot returned no reply. Retry reply.");
-      setMessages((current) => {
-        if (!current.some((message) => message.id === messageId)) return current;
-        return [...current.map((message) => message.id === messageId ? { ...message, reply: undefined } : message), { id: crypto.randomUUID(), role: "bot", text: reply.reply, speechText: reply.speech_text || reply.reply, language: reply.speech_language || request.speechLanguage }];
-      });
-    } catch (cause) {
-      const detail = cause instanceof Error ? cause.message : "AI Bot could not reply. Retry reply.";
-      setMessages((current) => current.map((message) => message.id === messageId ? { ...message, reply: { request, status: "failed", error: detail } } : message));
-    } finally { replying.current.delete(messageId); setStatus("idle"); }
-  };
+  function requestReply(turn: Turn) {
+    if (turn.status === "ready") return;
+    void run(turn.id, async (signal) => {
+      const save = (patch: Pick<Turn, "status" | "reply">) => update((data) => ({
+        ...data, turns: data.turns.map((item) => item.id === turn.id ? { ...item, ...patch } : item),
+      }));
+      save({ status: "pending" });
+      try {
+        const result = await postChatForm("/api/bot/reply", {
+          message: turn.source.text, style: turn.request.style, history: JSON.stringify(turn.request.history),
+        }, signal);
+        if (typeof result.reply !== "string" || !result.reply.trim()) throw new Error("AI Bot returned no reply.");
+        if (!signal.aborted) save({
+          status: "ready",
+          reply: {
+            text: result.reply,
+            speechText: result.speech_text || result.reply,
+            language: result.speech_language || turn.request.language,
+            style: turn.request.style,
+          },
+        });
+      } catch {
+        if (!signal.aborted) save({ status: "failed" });
+      }
+    });
+  }
 
-  const retryReply = (message: BotMessage) => { if (message.role === "user" && message.reply?.status === "failed") void requestReply(message.id, message.reply.request); };
-  const start = async () => {
-    setError("");
-    try { const next = new WavRecorder(); await next.start(); recorder.current = next; setStatus("recording"); }
-    catch (cause) { setStatus("idle"); setError(cause instanceof Error ? `Microphone unavailable: ${cause.message}` : "Microphone permission was denied. Allow access and try again."); }
-  };
-  const stop = async () => {
-    const active = recorder.current; if (!active) return; recorder.current = null; setStatus("converting"); setError("");
-    try {
-      const audio = await active.stop(); setStatus("transcribing");
-      const transcriptionBody = new FormData(); transcriptionBody.append("audio", audio, "language-friend-bot.wav"); transcriptionBody.append("language", spoken.tag);
-      const transcriptionResponse = await fetch("/api/transcribe", { method: "POST", body: transcriptionBody }); const transcription = await transcriptionResponse.json().catch(() => ({}));
-      if (!transcriptionResponse.ok) throw new Error(transcription.detail || "Speech transcription failed. Please try again.");
-      const history = messages.slice(-12).map(({ role, text }) => ({ role, text })); const userMessage: BotMessage = { id: crypto.randomUUID(), role: "user", text: transcription.transcript };
-      const request: ReplyRequest = { message: transcription.transcript, style: chat.value, speechLanguage: chat.tag, history };
-      setMessages((current) => [...current, userMessage]); await requestReply(userMessage.id, request);
-    } catch (cause) { setStatus("idle"); setError(cause instanceof Error ? cause.message : "The request failed. Please try again."); }
-  };
-  const busy = status !== "idle" && status !== "recording";
-  return <main className="ai-chat-screen"><section className="ai-chat-card" aria-label="AI Bot conversation"><div className="ai-chat-heading"><span className="ai-icon" aria-hidden="true">🤖</span><div><h2>AI Bot</h2><p>Replies in {chat.label}</p></div></div>
-    <div className="ai-messages" aria-live="polite">{messages.length === 0 && <p className="ai-empty">Tap the microphone and speak in {spoken.label}.</p>}{messages.map((message) => <BotBubble key={message.id} message={message} fallbackLanguage={chat.tag} onRetryReply={retryReply} />)}</div>
-    {(status !== "idle" || error) && <div className="ai-status" role={error ? "alert" : "status"}>{error || statusText[status]}</div>}
-    <button className="mic-button owner-mic ai-mic" disabled={busy} onClick={() => status === "recording" ? void stop() : void start()} aria-label={status === "recording" ? "Stop recording" : `Start recording in ${spoken.label}`}>🎙 <span>{status === "recording" ? "Stop listening" : `${spoken.label} mic`}</span></button>
-  </section></main>;
+  function addTurn(capture: Capture, text: string) {
+    const history = turns.flatMap<HistoryMessage>((turn) => [
+      { role: "user", text: turn.source.text },
+      ...(turn.reply ? [{ role: "bot" as const, text: turn.reply.text }] : []),
+    ]).slice(-12);
+    const turn: Turn = {
+      id: crypto.randomUUID(),
+      source: { text, speechText: text, language: capture.language, style: capture.sourceStyle },
+      request: { style: capture.replyStyle, language: capture.replyLanguage, history },
+      status: "pending",
+    };
+    update((data) => ({ ...data, capture: undefined, turns: [...data.turns, turn] }));
+    requestReply(turn);
+  }
+
+  const voice = useVoiceCapture<Capture>(
+    (capture) => update((data) => ({ ...data, capture })),
+    addTurn,
+  );
+  const busy = voice.busy || inFlight.size > 0;
+  const status = voice.error || voice.status || (voice.recording ? "Listening… tap again when finished" : "");
+  return <main className="ai-chat-screen">
+    <section className="ai-chat-card" aria-label="AI Bot conversation">
+      <div className="ai-chat-heading"><span className="ai-icon" aria-hidden="true">🤖</span><div><h2>AI Bot</h2><p>Replies in {chat.label}</p></div></div>
+      <div className="ai-messages" aria-live="polite">
+        {!turns.length && !interrupted && <p className="ai-empty">Tap the microphone and speak in {spoken.label}.</p>}
+        {turns.map((turn) => <div className="ai-turn" key={turn.id}>
+          <div className="ai-message ai-user-message" data-style={turn.source.style} lang={turn.source.language}>
+            <small>You</small><span>{turn.source.text}</span>
+            {turn.status !== "ready" && <div className="translation-retry" role="status">
+              {inFlight.has(turn.id) ? "AI Bot is replying…" : <>
+                <span>{turn.status === "pending" ? "Reply was interrupted." : "AI Bot could not reply."}</span>
+                <button type="button" disabled={busy || Boolean(voice.recording)} onClick={() => requestReply(turn)}>Retry reply</button>
+              </>}
+            </div>}
+          </div>
+          {turn.reply && <div className="ai-message ai-bot-message" data-style={turn.reply.style} lang={turn.reply.language}>
+            <small>AI Bot</small><span>{turn.reply.text}</span>{" "}
+            <SpeechButton text={turn.reply.text} speechText={turn.reply.speechText} language={turn.reply.language} />
+          </div>}
+        </div>)}
+        {interrupted && !voice.busy && !voice.recording && <div className="translation-retry" role="status">
+          <span>Recording needs to be captured again.</span>
+          <button type="button" disabled={busy} onClick={() => voice.start(interrupted)}>Record again</button>
+        </div>}
+      </div>
+      {status && <div className="ai-status" role={voice.error ? "alert" : "status"}>{status}</div>}
+      <button className="mic-button owner-mic ai-mic" disabled={busy} onClick={() => voice.recording ? voice.stop() : voice.start({
+        language: spoken.tag, sourceStyle: spoken.value, replyStyle: chat.value, replyLanguage: chat.tag,
+      })} aria-label={voice.recording ? "Stop recording" : "Start recording in " + spoken.label}>
+        🎙 <span>{voice.recording ? "Stop listening" : spoken.label + " mic"}</span>
+      </button>
+    </section>
+  </main>;
 }

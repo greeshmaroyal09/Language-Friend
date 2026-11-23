@@ -22,6 +22,23 @@ export const PARTNER_LANGUAGES = ["English", "Telugu", "Kannada", "Tamil", "Hind
 export const getSpokenLanguage = (value: string) => SPOKEN_LANGUAGES.find((language) => language.value === value) ?? SPOKEN_LANGUAGES[0];
 export const getChatLanguage = (value: string) => CHAT_LANGUAGES.find((language) => language.value === value) ?? CHAT_LANGUAGES[5];
 
+const indicScripts = [
+  { script: /\p{Script=Telugu}/u, native: "Telugu", roman: "Tenglish" },
+  { script: /\p{Script=Devanagari}/u, native: "Hindi", roman: "Hinglish" },
+  { script: /\p{Script=Kannada}/u, native: "Kannada", roman: "Kanglish" },
+  { script: /\p{Script=Tamil}/u, native: "Tamil", roman: "Tanglish" },
+];
+
+export const isRomanStyle = (value: string) => indicScripts.some(({ roman }) => roman === value);
+
+export function typedLanguage(text: string, preferred: ChatLanguage): ChatLanguage {
+  const expected = indicScripts.find(({ native, roman }) => preferred.value === native || preferred.value === roman);
+  const actual = expected?.script.test(text) ? expected : indicScripts.find(({ script }) => script.test(text));
+  if (actual) return getChatLanguage(actual.native);
+  if (expected && /[a-z]/i.test(text)) return getChatLanguage(expected.roman);
+  return preferred;
+}
+
 export function migrateLegacyPreference(value: string | null) {
   const chat = CHAT_LANGUAGES.some((language) => language.value === value) ? value! : "Tenglish";
   const spokenMap: Record<string, string> = { Tenglish: "Telugu", Hinglish: "Hindi", Kanglish: "Kannada", Tanglish: "Tamil" };

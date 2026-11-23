@@ -1,6 +1,7 @@
 """Language Friend voice API. Provider keys remain on the backend."""
 import asyncio
 import json
+import logging
 import os
 import time
 import wave
@@ -14,6 +15,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from audio import normalize_gnani_wav
+from amounts import AMOUNT_INSTRUCTION, protect_amounts
 
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 ENV_VALUES = dotenv_values(ENV_PATH)
@@ -30,21 +32,37 @@ BOT_GEMINI_FALLBACK_SLICE_SECONDS = 10.0
 TRANSLATION_BUDGET_SECONDS = 45.0
 GEMINI_FALLBACK_SLICE_SECONDS = 10.0
 SARVAM_SINGLE_REQUEST_SECONDS = 32.0
-SARVAM_ROMAN_REQUEST_SECONDS = 16.0
+SARVAM_ROMAN_RECOVERY_SECONDS = 12.0
 SARVAM_TRANSLATE_URL = "https://api.sarvam.ai/translate"
+SARVAM_TRANSLITERATE_URL = "https://api.sarvam.ai/transliterate"
 SARVAM_TRANSLATION_MODEL = "mayura:v1"
 SARVAM_CHAT_URL = "https://api.sarvam.ai/v2/chat/completions"
 SARVAM_CHAT_MODEL = "glm5.3-flash"
+SARVAM_BOT_MAX_TOKENS = 768
 ROMAN_STYLES = {"Tenglish", "Hinglish", "Kanglish", "Tanglish"}
 STYLE_LANGUAGE_CODES = {"Telugu": "te-IN", "Tenglish": "te-IN", "Hindi": "hi-IN", "Hinglish": "hi-IN", "Kannada": "kn-IN", "Kanglish": "kn-IN", "Tamil": "ta-IN", "Tanglish": "ta-IN", "English": "en-IN"}
 LANGUAGE_NAMES = {"en-IN": "English", "te-IN": "Telugu", "kn-IN": "Kannada", "hi-IN": "Hindi", "ta-IN": "Tamil"}
 NATIVE_SCRIPT_RANGES = {"Tenglish": (0x0C00, 0x0C7F), "Hinglish": (0x0900, 0x097F), "Kanglish": (0x0C80, 0x0CFF), "Tanglish": (0x0B80, 0x0BFF)}
+BOT_LOGGER = logging.getLogger("language_friend.bot_reply")
 
 @dataclass(frozen=True)
 class TranslationResult:
     display: str
     speech_text: str
     provider: str = "gemini"
+
+
+@dataclass(frozen=True)
+class BotReplyCandidate:
+    display: str | None
+    speech_text: str | None
+    json_status: str
+
+
+def bot_reply_diagnostic(provider: str, style: str, phase: str, **metadata: object) -> None:
+    """Log only reply-processing metadata; never include prompts, replies, or keys."""
+    event = {"provider": provider, "style": style, "phase": phase, **metadata}
+    BOT_LOGGER.info("bot_reply_diagnostic %s", json.dumps(event, sort_keys=True, separators=(",", ":")))
 
 def required(name: str) -> str:
     value = os.getenv(name)
@@ -111,34 +129,68 @@ async def gemini(contents: list[dict], system_instruction: str, *, operation: st
     try: return response.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
     except (KeyError, IndexError, TypeError): raise HTTPException(502, "Gemini returned no usable text.") from None
 
-def remaining_bot_reply_time(deadline: float, limit: float) -> float:
-    remaining = min(limit, deadline - time.monotonic())
+def remaining_bot_reply_time(deadline: float, limit: float, reserve: float = 0.0) -> float:
+    """Return a bounded provider timeout while preserving time for a Roman recovery."""
+    remaining = min(limit, deadline - time.monotonic() - reserve)
     if remaining <= 0: raise HTTPException(503, "AI reply services are temporarily unavailable. Retry reply.")
     return remaining
 
-async def gemini_bot_reply(contents: list[dict], style: str, deadline: float) -> TranslationResult | None:
+def gemini_bot_response(response: httpx.Response) -> tuple[str, str | None]:
+    try:
+        candidate = response.json()["candidates"][0]
+        return candidate["content"]["parts"][0]["text"].strip(), candidate.get("finishReason")
+    except (AttributeError, KeyError, IndexError, TypeError, ValueError):
+        raise HTTPException(502, "Gemini returned no usable text.") from None
+
+
+async def gemini_bot_reply(contents: list[dict], style: str, deadline: float, max_wait_seconds: float = BOT_GEMINI_FALLBACK_SLICE_SECONDS) -> TranslationResult | None:
     """Return None only when the single configured Sarvam fallback should take over."""
     key = required("GEMINI_API_KEY"); model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-    timeout = remaining_bot_reply_time(deadline, BOT_GEMINI_FALLBACK_SLICE_SECONDS)
+    timeout = remaining_bot_reply_time(deadline, max_wait_seconds)
     payload = {"systemInstruction": {"parts": [{"text": bot_instruction(style)}]}, "contents": contents, "generationConfig": {"temperature": 0.35, "maxOutputTokens": 512}}
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
             async with asyncio.timeout(timeout): response = await client.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent", params={"key": key}, json=payload)
     except (TimeoutError, httpx.ReadTimeout):
+        bot_reply_diagnostic("gemini", style, "transport", outcome="timeout")
         return None
     except httpx.RequestError as error:
+        bot_reply_diagnostic("gemini", style, "transport", outcome="request_error", error_type=type(error).__name__)
         raise gemini_failure("reply") from error
-    if response.status_code in {429, 503}: return None
-    if response.is_error: raise gemini_failure("reply", response.status_code)
-    try: return bot_reply_result(response_text(response), style, provider="gemini")
-    except HTTPException: return None
+    if response.status_code in {429, 503}:
+        bot_reply_diagnostic("gemini", style, "upstream", status_code=response.status_code, outcome="fallback")
+        return None
+    if response.is_error:
+        bot_reply_diagnostic("gemini", style, "upstream", status_code=response.status_code, outcome="error")
+        raise gemini_failure("reply", response.status_code)
+    try:
+        reply_text, finish_reason = gemini_bot_response(response)
+    except HTTPException:
+        bot_reply_diagnostic("gemini", style, "parse", json_status="response_shape_invalid", outcome="fallback")
+        return None
+    bot_reply_diagnostic("gemini", style, "upstream", status_code=response.status_code, finish_reason=finish_reason, content_length=len(reply_text))
+    try:
+        return await resolve_bot_reply(reply_text, style, provider="gemini", deadline=deadline, finish_reason=finish_reason, allow_recovery=False)
+    except HTTPException:
+        return None
 
 def translation_instruction(target_style: str, roman_output: bool) -> str:
     base = f"Translate the message faithfully for a live two-person conversation. Preserve the speaker's intent, quantities, prices, and whether an action is stated. A desire, need, request, or availability statement is not a purchase action. Do not infer a transaction from an item, packet, shop context, or price; use buy or purchase wording only when the source explicitly states that action. Preserve the speaker's level of respect and number in forms of address. Respect may be carried by the verb ending even when a pronoun is omitted: do not turn familiar singular speech into respectful or plural speech, or vice versa. Use natural target-language pronouns and matching verb forms. Use everyday wording and keep natural loanwords where appropriate. {style_instruction(target_style)}"
     if not roman_output:
         return f"{base} Return only the translated message, with no notes or quotation marks."
     native = {"Tenglish": "Telugu", "Hinglish": "Hindi", "Kanglish": "Kannada", "Tanglish": "Tamil"}[target_style]
-    return f'{base} Return a JSON object with exactly two string fields: "display" must be the requested Romanized output, and "speech_text" must be the same translation in native {native} script for speech synthesis. Return no other text.'
+    return f'{base} First write the idiomatic {native} translation in its native script for "speech_text". Then transliterate those exact words into Latin script for "display". Return only a JSON object with these two string fields. Use everyday target-language forms rather than copying similar-looking source words or pronouns.'
+
+def transliteration_instruction(source_style: str, target_style: str) -> str:
+    base = (
+        f"Convert only the script of the input from {source_style} to {target_style}. "
+        "Keep the original words, names, register, numbers, and punctuation. "
+        "Do not paraphrase, translate loanwords, add information, or answer the message. "
+        + style_instruction(target_style)
+    )
+    if target_style in ROMAN_STYLES:
+        return base + ' Return only a JSON object with "display" in Latin script and "speech_text" in the original native script.'
+    return base + " Return only the result."
 
 def response_text(response: httpx.Response) -> str:
     try: return response.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
@@ -147,14 +199,20 @@ def response_text(response: httpx.Response) -> str:
 def translation_result(text: str, roman_output: bool, provider: str = "gemini") -> TranslationResult:
     if not roman_output:
         return TranslationResult(display=text, speech_text=text, provider=provider)
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1] if "\n" in text else ""
-        if text.endswith("```"): text = text[:-3]
+    text = unfence_json(text)
     try:
         body = json.loads(text); display = body["display"].strip(); speech_text = body["speech_text"].strip()
     except (json.JSONDecodeError, KeyError, AttributeError, TypeError): raise HTTPException(502, "Gemini returned an unusable translation format.") from None
     if not display or not speech_text: raise HTTPException(502, "Gemini returned an unusable translation format.")
     return TranslationResult(display=display, speech_text=speech_text, provider=provider)
+
+
+def unfence_json(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else ""
+        if text.endswith("```"): text = text[:-3]
+    return text.strip()
 
 def contains_native_script(text: str, style: str) -> bool:
     lower, upper = NATIVE_SCRIPT_RANGES[style]
@@ -163,17 +221,75 @@ def contains_native_script(text: str, style: str) -> bool:
 def contains_latin(text: str) -> bool:
     return any("A" <= character <= "Z" or "a" <= character <= "z" for character in text)
 
+
+def contains_supported_native_script(text: str) -> bool:
+    return any(contains_native_script(text, style) for style in ROMAN_STYLES)
+
+
+def native_text_is_valid(text: str | None, style: str) -> bool:
+    return bool(text and contains_native_script(text, style) and not any(contains_native_script(text, other_style) for other_style in ROMAN_STYLES if other_style != style))
+
+
+def roman_text_is_valid(text: str | None) -> bool:
+    return bool(text and contains_latin(text) and not contains_supported_native_script(text))
+
+
+def bot_reply_candidate(text: str, style: str) -> BotReplyCandidate:
+    """Extract a Roman pair without accepting it as valid or logging its contents."""
+    body_text = unfence_json(text)
+    try:
+        body = json.loads(body_text)
+    except json.JSONDecodeError:
+        # A provider occasionally drops the JSON wrapper but still returns one
+        # native-script answer. It is safe to use only after script validation.
+        return BotReplyCandidate(None, body_text or None, "invalid_json_plain_text")
+    if not isinstance(body, dict): return BotReplyCandidate(None, None, "json_not_object")
+    display = body.get("display")
+    speech_text = body.get("speech_text")
+    return BotReplyCandidate(
+        display.strip() if isinstance(display, str) else None,
+        speech_text.strip() if isinstance(speech_text, str) else None,
+        "json_object" if isinstance(display, str) and isinstance(speech_text, str) else "json_fields_invalid",
+    )
+
+
+def reply_script_metadata(candidate: BotReplyCandidate, style: str) -> dict[str, object]:
+    display, speech_text = candidate.display, candidate.speech_text
+    return {
+        "json_status": candidate.json_status,
+        "display_length": len(display or ""),
+        "speech_length": len(speech_text or ""),
+        "display_latin": contains_latin(display or ""),
+        "display_native": contains_native_script(display or "", style),
+        "speech_latin": contains_latin(speech_text or ""),
+        "speech_native": contains_native_script(speech_text or "", style),
+        "speech_other_native": bool(speech_text) and contains_supported_native_script(speech_text) and not contains_native_script(speech_text, style),
+    }
+
+
+def valid_roman_reply(candidate: BotReplyCandidate, style: str, provider: str) -> TranslationResult | None:
+    if roman_text_is_valid(candidate.display) and native_text_is_valid(candidate.speech_text, style):
+        return TranslationResult(display=candidate.display or "", speech_text=candidate.speech_text or "", provider=provider)
+    return None
+
+
+def recovery_source(candidate: BotReplyCandidate, style: str) -> tuple[str, str, str] | None:
+    """Prefer the native reply so display and speech remain one coherent answer."""
+    for text, origin in ((candidate.speech_text, "speech_text"), (candidate.display, "display")):
+        if native_text_is_valid(text, style): return text or "", STYLE_LANGUAGE_CODES[style], origin
+    for text, origin in ((candidate.display, "display"), (candidate.speech_text, "speech_text")):
+        if roman_text_is_valid(text): return text or "", "en-IN", origin
+    return None
+
+
+def reply_was_truncated(finish_reason: str | None) -> bool:
+    return (finish_reason or "").lower() in {"length", "max_tokens"}
+
 def bot_reply_result(text: str, style: str, provider: str) -> TranslationResult:
-    result = translation_result(text, style in ROMAN_STYLES, provider=provider)
-    if style not in ROMAN_STYLES: return result
-    display, speech_text = result.display, result.speech_text
-    # Correct only the unambiguous reversed-field provider response. Otherwise
-    # reject it rather than showing native script under a Roman-language setting.
-    if contains_native_script(display, style) and contains_latin(speech_text) and not contains_native_script(speech_text, style):
-        display, speech_text = speech_text, display
-    if not contains_latin(display) or contains_native_script(display, style) or not contains_native_script(speech_text, style):
-        raise HTTPException(502, "AI reply provider returned the wrong script format.")
-    return TranslationResult(display=display, speech_text=speech_text, provider=provider)
+    if style not in ROMAN_STYLES: return translation_result(text, False, provider=provider)
+    result = valid_roman_reply(bot_reply_candidate(text, style), style, provider)
+    if not result: raise HTTPException(502, "AI reply provider returned the wrong script format.")
+    return result
 
 def gemini_translation_result(response: httpx.Response, roman_output: bool) -> TranslationResult:
     return translation_result(response_text(response), roman_output)
@@ -183,11 +299,11 @@ def remaining_translation_time(deadline: float, limit: float) -> float:
     if remaining <= 0: raise HTTPException(503, "Translation services are temporarily unavailable. Please retry.")
     return remaining
 
-async def gemini_translation(message: str, target_style: str, deadline: float) -> TranslationResult | None:
+async def gemini_translation(message: str, target_style: str, deadline: float, instruction: str | None = None) -> TranslationResult | None:
     """Return None only when a configured Sarvam fallback should take over."""
     key = required("GEMINI_API_KEY"); model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash"); roman_output = target_style in ROMAN_STYLES
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    payload = {"systemInstruction": {"parts": [{"text": translation_instruction(target_style, roman_output)}]}, "contents": [{"role": "user", "parts": [{"text": message}]}], "generationConfig": {"temperature": 0.35}}
+    payload = {"systemInstruction": {"parts": [{"text": instruction or translation_instruction(target_style, roman_output)}]}, "contents": [{"role": "user", "parts": [{"text": message}]}], "generationConfig": {"temperature": 0.35}}
     timeout = remaining_translation_time(deadline, GEMINI_FALLBACK_SLICE_SECONDS)
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
@@ -198,7 +314,8 @@ async def gemini_translation(message: str, target_style: str, deadline: float) -
         raise HTTPException(502, f"Gemini request could not be completed: {type(error).__name__}. Please retry.") from None
     if response.status_code in {429, 503}: return None
     if response.is_error: raise HTTPException(502, f"Gemini request failed: {response.text[:240]}")
-    return gemini_translation_result(response, roman_output)
+    try: return gemini_translation_result(response, roman_output)
+    except HTTPException: return None
 
 def sarvam_payload(message: str, source_language: str, target_language: str, target_style: str, output_script: str | None) -> dict:
     payload = {"input": message, "source_language_code": source_language, "target_language_code": target_language, "model": SARVAM_TRANSLATION_MODEL, "mode": "code-mixed" if target_style in ROMAN_STYLES else "modern-colloquial"}
@@ -224,16 +341,16 @@ def sarvam_chat_instruction(source_language: str, target_style: str, roman_outpu
     base = f"Translate only the user's message from {source} to {target} for a live two-person conversation. Do not answer the message. Preserve its meaning, quantities, prices, actions, second-person number, and level of respect exactly. Familiar and respectful address are different meanings. The source may encode this only in a verb ending; retain the matching target-language verb ending and do not make it more formal. {style_instruction(target_style)}"
     if not roman_output: return f"{base} Return only the translation, with no explanation or quotation marks."
     native = {"Tenglish": "Telugu", "Hinglish": "Hindi", "Kanglish": "Kannada", "Tanglish": "Tamil"}[target_style]
-    return f'{base} Return exactly one valid JSON object and nothing else: {{"display":"the Romanized {target} translation","speech_text":"the identical translation in native {native} script"}}.'
+    return f'{base} First write the idiomatic {native} translation in its native script, using everyday target-language forms rather than copying similar-looking source words or pronouns. Transliterate those exact words for display. Return only a JSON object: {{"speech_text":"the translation in native {native} script","display":"those exact words in Latin script"}}.'
 
-async def sarvam_chat_translation(message: str, source_language: str, target_style: str, deadline: float) -> TranslationResult:
+async def sarvam_chat_translation(message: str, source_language: str, target_style: str, deadline: float, instruction: str | None = None) -> TranslationResult:
     """Instruction-following translation fallback; never used for AI Bot replies."""
     key = required("SARVAM_API_KEY"); roman_output = target_style in ROMAN_STYLES
     timeout = remaining_translation_time(deadline, SARVAM_SINGLE_REQUEST_SECONDS)
     payload = {
         "model": os.getenv("SARVAM_CHAT_MODEL", SARVAM_CHAT_MODEL),
         "messages": [
-            {"role": "system", "content": sarvam_chat_instruction(source_language, target_style, roman_output)},
+            {"role": "system", "content": instruction or sarvam_chat_instruction(source_language, target_style, roman_output)},
             {"role": "user", "content": message},
         ],
         "max_tokens": 192,
@@ -251,14 +368,91 @@ async def sarvam_chat_translation(message: str, source_language: str, target_sty
     if not translated: raise HTTPException(503, "Translation services are temporarily unavailable. Please retry.")
     return translation_result(translated, roman_output, provider="sarvam-chat")
 
+
+async def sarvam_transliterate_bot_reply(text: str, source_language: str, target_language: str, style: str, deadline: float) -> str:
+    """Use Sarvam's documented native<->English transliteration directions for a repaired Roman pair."""
+    key = required("SARVAM_API_KEY")
+    timeout = remaining_bot_reply_time(deadline, SARVAM_ROMAN_RECOVERY_SECONDS)
+    payload = {
+        "input": text,
+        "source_language_code": source_language,
+        "target_language_code": target_language,
+        "numerals_format": "international",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
+            async with asyncio.timeout(timeout): response = await client.post(os.getenv("SARVAM_TRANSLITERATE_URL", SARVAM_TRANSLITERATE_URL), headers={"api-subscription-key": key}, json=payload)
+    except (TimeoutError, httpx.RequestError) as error:
+        bot_reply_diagnostic("sarvam-transliterate", style, "transport", outcome="error", error_type=type(error).__name__, direction=f"{source_language}->{target_language}")
+        raise HTTPException(503, "AI reply services are temporarily unavailable. Retry reply.") from None
+    if response.is_error:
+        bot_reply_diagnostic("sarvam-transliterate", style, "upstream", outcome="error", status_code=response.status_code, direction=f"{source_language}->{target_language}")
+        raise HTTPException(503, "AI reply services are temporarily unavailable. Retry reply.")
+    try: transliterated = response.json()["transliterated_text"].strip()
+    except (AttributeError, KeyError, TypeError, ValueError):
+        bot_reply_diagnostic("sarvam-transliterate", style, "parse", outcome="invalid_response", direction=f"{source_language}->{target_language}")
+        raise HTTPException(503, "AI reply services are temporarily unavailable. Retry reply.") from None
+    if not transliterated:
+        bot_reply_diagnostic("sarvam-transliterate", style, "parse", outcome="empty", direction=f"{source_language}->{target_language}")
+        raise HTTPException(503, "AI reply services are temporarily unavailable. Retry reply.")
+    bot_reply_diagnostic("sarvam-transliterate", style, "upstream", outcome="success", status_code=response.status_code, direction=f"{source_language}->{target_language}", content_length=len(transliterated))
+    return transliterated
+
+
+async def resolve_bot_reply(text: str, style: str, provider: str, deadline: float, finish_reason: str | None = None, allow_recovery: bool = True) -> TranslationResult:
+    """Validate a provider reply and, for Roman styles, repair one canonical script safely."""
+    if reply_was_truncated(finish_reason):
+        bot_reply_diagnostic(provider, style, "validation", finish_reason=finish_reason, outcome="truncated")
+        raise HTTPException(502, "AI reply provider returned an incomplete reply.")
+    if style not in ROMAN_STYLES:
+        result = bot_reply_result(text, style, provider)
+        bot_reply_diagnostic(provider, style, "validation", finish_reason=finish_reason, outcome="accepted", reply_length=len(result.display))
+        return result
+
+    candidate = bot_reply_candidate(text, style)
+    metadata = reply_script_metadata(candidate, style)
+    direct = valid_roman_reply(candidate, style, provider)
+    if direct:
+        bot_reply_diagnostic(provider, style, "validation", finish_reason=finish_reason, outcome="accepted", **metadata)
+        return direct
+
+    bot_reply_diagnostic(provider, style, "validation", finish_reason=finish_reason, outcome="recovery_needed", **metadata)
+    if not allow_recovery:
+        bot_reply_diagnostic(provider, style, "recovery", outcome="deferred_to_fallback")
+        raise HTTPException(502, "AI reply provider returned an unusable reply.")
+    source = recovery_source(candidate, style)
+    if not source:
+        bot_reply_diagnostic(provider, style, "recovery", outcome="no_coherent_source")
+        raise HTTPException(502, "AI reply provider returned an unusable reply.")
+    if not os.getenv("SARVAM_API_KEY"):
+        bot_reply_diagnostic(provider, style, "recovery", outcome="transliteration_unconfigured")
+        raise HTTPException(502, "AI reply provider returned an unusable reply.")
+
+    canonical, source_language, field = source
+    target_language = "en-IN" if source_language != "en-IN" else STYLE_LANGUAGE_CODES[style]
+    transliterated = await sarvam_transliterate_bot_reply(canonical, source_language, target_language, style, deadline)
+    repaired = BotReplyCandidate(
+        transliterated if source_language != "en-IN" else canonical,
+        canonical if source_language != "en-IN" else transliterated,
+        "transliterated_recovery",
+    )
+    result = valid_roman_reply(repaired, style, f"{provider}+sarvam-transliterate")
+    if not result:
+        bot_reply_diagnostic(provider, style, "recovery", outcome="script_validation_failed", field=field, direction=f"{source_language}->{target_language}", **reply_script_metadata(repaired, style))
+        raise HTTPException(502, "AI reply provider returned an unusable reply.")
+    bot_reply_diagnostic(provider, style, "recovery", outcome="accepted", field=field, direction=f"{source_language}->{target_language}", **reply_script_metadata(repaired, style))
+    return result
+
+
 async def sarvam_bot_reply(messages: list[dict], style: str, deadline: float) -> TranslationResult:
     """One bounded conversational fallback for AI Bot; never a translation request."""
     key = required("SARVAM_API_KEY")
-    timeout = remaining_bot_reply_time(deadline, SARVAM_SINGLE_REQUEST_SECONDS)
+    reserve = SARVAM_ROMAN_RECOVERY_SECONDS if style in ROMAN_STYLES else 0.0
+    timeout = remaining_bot_reply_time(deadline, SARVAM_SINGLE_REQUEST_SECONDS, reserve=reserve)
     payload = {
         "model": os.getenv("SARVAM_CHAT_MODEL", SARVAM_CHAT_MODEL),
         "messages": [{"role": "system", "content": bot_instruction(style)}, *messages],
-        "max_tokens": 512,
+        "max_tokens": SARVAM_BOT_MAX_TOKENS,
         "temperature": 0.2,
         "reasoning_effort": "low",
     }
@@ -267,6 +461,7 @@ async def sarvam_bot_reply(messages: list[dict], style: str, deadline: float) ->
             "type": "json_schema",
             "json_schema": {
                 "name": "bot_reply",
+                "strict": True,
                 "schema": {
                     "type": "object",
                     "properties": {"display": {"type": "string"}, "speech_text": {"type": "string"}},
@@ -278,24 +473,80 @@ async def sarvam_bot_reply(messages: list[dict], style: str, deadline: float) ->
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
             async with asyncio.timeout(timeout): response = await client.post(os.getenv("SARVAM_CHAT_URL", SARVAM_CHAT_URL), headers={"api-subscription-key": key}, json=payload)
-    except (TimeoutError, httpx.RequestError):
+    except (TimeoutError, httpx.RequestError) as error:
+        bot_reply_diagnostic("sarvam-chat", style, "transport", outcome="error", error_type=type(error).__name__)
         raise HTTPException(503, "AI reply services are temporarily unavailable. Retry reply.") from None
-    if response.is_error: raise HTTPException(503, "AI reply services are temporarily unavailable. Retry reply.")
-    try: reply_text = response.json()["choices"][0]["message"]["content"].strip()
-    except (KeyError, IndexError, TypeError, ValueError): raise HTTPException(503, "AI reply services are temporarily unavailable. Retry reply.") from None
-    if not reply_text: raise HTTPException(503, "AI reply services are temporarily unavailable. Retry reply.")
-    try: return bot_reply_result(reply_text, style, provider="sarvam-chat")
+    if response.is_error:
+        bot_reply_diagnostic("sarvam-chat", style, "upstream", outcome="error", status_code=response.status_code)
+        raise HTTPException(503, "AI reply services are temporarily unavailable. Retry reply.")
+    try:
+        choice = response.json()["choices"][0]
+        reply_text = choice["message"]["content"].strip()
+        finish_reason = choice.get("finish_reason")
+    except (AttributeError, KeyError, IndexError, TypeError, ValueError):
+        bot_reply_diagnostic("sarvam-chat", style, "parse", outcome="response_shape_invalid")
+        raise HTTPException(503, "AI reply services are temporarily unavailable. Retry reply.") from None
+    if not reply_text:
+        bot_reply_diagnostic("sarvam-chat", style, "parse", outcome="empty", finish_reason=finish_reason)
+        raise HTTPException(503, "AI reply services are temporarily unavailable. Retry reply.")
+    bot_reply_diagnostic("sarvam-chat", style, "upstream", outcome="success", status_code=response.status_code, finish_reason=finish_reason, content_length=len(reply_text))
+    try: return await resolve_bot_reply(reply_text, style, provider="sarvam-chat", deadline=deadline, finish_reason=finish_reason)
     except HTTPException: raise HTTPException(503, "AI reply services returned an unusable reply. Retry reply.") from None
 
 async def translate_conversation(message: str, source_language: str, source_style: str, target_language: str, target_style: str) -> TranslationResult:
     roman_output = target_style in ROMAN_STYLES
+    same_language = source_language == target_language
+    preserve_display = same_language and roman_output and source_style == target_style
+    instruction = transliteration_instruction(source_style, LANGUAGE_NAMES[target_language] if preserve_display else target_style) if same_language else None
+    provider_style = LANGUAGE_NAMES[target_language] if preserve_display else target_style
+    amounts = protect_amounts(message, source_language)
+    gemini_instruction = instruction
+    fallback_instruction = instruction
+    if amounts.replacements:
+        gemini_instruction = (instruction or translation_instruction(target_style, roman_output)) + AMOUNT_INSTRUCTION
+        fallback_instruction = (instruction or sarvam_chat_instruction(source_language, target_style, roman_output)) + AMOUNT_INSTRUCTION
+    preserve_speech = roman_output and same_language and source_style not in ROMAN_STYLES and native_text_is_valid(message, target_style)
+    if amounts.replacements and not amounts.contains_words:
+        number = amounts.restore(amounts.text)
+        if number is not None:
+            return TranslationResult(number, message if preserve_speech else number, provider="local")
+
+    def finish(result: TranslationResult) -> TranslationResult | None:
+        display = message if preserve_display else amounts.restore(result.display)
+        speech = message if preserve_speech else amounts.restore(result.speech_text)
+        if display is None or speech is None:
+            return None
+        return TranslationResult(display, speech, result.provider)
+
+    def usable(result: TranslationResult) -> bool:
+        # Numbers and punctuation also work as utterances. Otherwise reject a
+        # provider result written in the wrong script for either output.
+        if not any(character.isalpha() for character in message):
+            return bool(result.display.strip() and result.speech_text.strip())
+        native_style = next((style for style in ROMAN_STYLES if STYLE_LANGUAGE_CODES[style] == target_language), None)
+        if native_style:
+            return native_text_is_valid(result.speech_text, native_style) and (
+                roman_text_is_valid(result.display) if roman_output else native_text_is_valid(result.display, native_style)
+            )
+        return roman_text_is_valid(result.display) and roman_text_is_valid(result.speech_text)
+
     if not os.getenv("SARVAM_API_KEY"):
-        translated = await gemini([{"role": "user", "parts": [{"text": message}]}], translation_instruction(target_style, roman_output))
-        return translation_result(translated, roman_output)
+        translated = await gemini(
+            [{"role": "user", "parts": [{"text": amounts.text}]}],
+            gemini_instruction or translation_instruction(target_style, roman_output),
+        )
+        result = finish(translation_result(translated, provider_style in ROMAN_STYLES))
+        if result and usable(result): return result
+        raise HTTPException(502, "Translation could not preserve the original amounts or writing script. Please retry.")
+
     deadline = time.monotonic() + TRANSLATION_BUDGET_SECONDS
-    primary = await gemini_translation(message, target_style, deadline)
-    if primary: return primary
-    return await sarvam_chat_translation(message, source_language, target_style, deadline)
+    primary = await gemini_translation(amounts.text, provider_style, deadline, gemini_instruction)
+    if primary:
+        result = finish(primary)
+        if result and usable(result): return result
+    result = finish(await sarvam_chat_translation(amounts.text, source_language, provider_style, deadline, fallback_instruction))
+    if result and usable(result): return result
+    raise HTTPException(502, "Translation could not preserve the original amounts or writing script. Please retry.")
 
 def style_instruction(style: str) -> str:
     if style in {"Tenglish", "Hinglish", "Kanglish", "Tanglish"}:
@@ -305,7 +556,17 @@ def style_instruction(style: str) -> str:
     return f"Write natural {style} using its native script. Do not transliterate it into Latin letters."
 
 def bot_instruction(style: str) -> str:
-    base = f"You are Language Friend, a warm conversational assistant. Answer naturally and directly in one or two concise sentences using everyday wording. {style_instruction(style)}"
+    base = (
+        "You are Language Friend, a warm conversational assistant. Answer naturally and directly in one or two concise sentences. "
+        "Address the user in a friendly, neutral way using ordinary polite wording. Do not address the user with unsolicited "
+        "familial, gendered, or familiar titles such as akka, anna, bro, sister, bhai, or equivalents in any language. "
+        "Use an address term only if the user explicitly asks you to call them that. Preserve such terms when they are part "
+        "of text the user asks you to translate or quote. When repeating a shopping list, preserve the exact items, quantities, "
+        "units, prices, and requested updates from the current message and conversation. Use the target language's ordinary "
+        "words for familiar foods and household items even if the list was provided in English. Leave brand names and "
+        "text requested verbatim as written. "
+        + style_instruction(style)
+    )
     if style not in ROMAN_STYLES:
         return f"{base} Return only the response."
     native = {"Tenglish": "Telugu", "Hinglish": "Hindi", "Kanglish": "Kannada", "Tanglish": "Tamil"}[style]
@@ -349,21 +610,24 @@ async def bot_reply(message: str = Form(...), style: str = Form(...), history: s
     try: parsed = json.loads(history)
     except json.JSONDecodeError: raise HTTPException(422, "Conversation history is invalid.") from None
     if not isinstance(parsed, list): raise HTTPException(422, "Conversation history is invalid.")
-    contents = []; sarvam_messages = []
+    contents = []; sarvam_messages = []; accepted_history = 0
     for item in parsed[-12:]:
         if not isinstance(item, dict) or item.get("role") not in {"user", "bot"} or not isinstance(item.get("text"), str): continue
         text = item["text"][:4000]
         contents.append({"role": "model" if item["role"] == "bot" else "user", "parts": [{"text": text}]})
         sarvam_messages.append({"role": "assistant" if item["role"] == "bot" else "user", "content": text})
+        accepted_history += 1
     current_message = message.strip()[:4000]
     contents.append({"role": "user", "parts": [{"text": current_message}]})
     sarvam_messages.append({"role": "user", "content": current_message})
+    bot_reply_diagnostic("route", style, "request", history_entries=len(parsed), accepted_history_entries=accepted_history, message_length=len(current_message))
+    deadline = time.monotonic() + BOT_REPLY_BUDGET_SECONDS
     if not os.getenv("SARVAM_API_KEY"):
-        reply = bot_reply_result(await gemini(contents, bot_instruction(style), operation="reply", timeout=BOT_REPLY_TIMEOUT, max_output_tokens=512), style, provider="gemini")
+        reply = await resolve_bot_reply(await gemini(contents, bot_instruction(style), operation="reply", timeout=BOT_REPLY_TIMEOUT, max_output_tokens=512), style, provider="gemini", deadline=deadline)
     else:
-        deadline = time.monotonic() + BOT_REPLY_BUDGET_SECONDS
         primary = await gemini_bot_reply(contents, style, deadline)
         reply = primary if primary else await sarvam_bot_reply(sarvam_messages, style, deadline)
+    bot_reply_diagnostic(reply.provider, style, "response", outcome="success", reply_length=len(reply.display), speech_length=len(reply.speech_text), speech_language=STYLE_LANGUAGE_CODES[style])
     return {"reply": reply.display, "speech_text": reply.speech_text, "speech_language": STYLE_LANGUAGE_CODES[style], "style": style, "provider": reply.provider}
 
 @app.post("/api/speech")

@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "lint": "oxlint --no-ignore src/main.tsx src/App.tsx src/audio.ts src/languages.ts src/speech.ts src/components/AIBotPlaceholder.tsx src/components/Header.tsx src/components/HumanChat.tsx src/components/SettingsProvider.tsx",
+    "lint": "oxlint --no-ignore src",
     "preview": "vite preview"
   },
   "dependencies": {
