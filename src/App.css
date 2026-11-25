@@ -44,3 +44,6 @@
 [data-theme="light"] :is(.translation-retry, .voice-unavailable, .ai-status) { color: #743b12; }
 [data-theme="light"] .dropdown-item:is(:hover, :focus-visible) { background: var(--accent-deep); }
 [data-theme="light"] :is(button, select):focus-visible { outline-color: var(--accent); }
+
+.install-guidance { margin: 0; color: var(--ink); font-size: .86rem; line-height: 1.45; }
+.app-offline { padding: 7px 14px; background: var(--accent-deep); border-bottom: 1px solid var(--line); text-align: center; font-size: .85rem; }

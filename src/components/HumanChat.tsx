@@ -15,7 +15,7 @@ type Delivery = {
   text?: string;
   speechText?: string;
 };
-type Turn = { id: string; speaker: Side; source: Source; owner: Delivery; other?: Delivery };
+type Turn = { id: string; source: Source; owner: Delivery; other?: Delivery };
 type HumanConversation = { partner: string | null; turns: Turn[]; capture?: Capture };
 
 function deliveryFor(source: Source, target: Language): Delivery {
@@ -28,6 +28,21 @@ function deliveryFor(source: Source, target: Language): Delivery {
     text: sameStyle ? source.text : undefined,
     speechText: sameStyle && !needsSpeechScript ? source.text : undefined,
   };
+}
+
+const readingScript = (style: string) => style === "English" || isRomanStyle(style) ? "Latin" : style;
+
+async function translate(source: Source, target: Delivery, signal: AbortSignal): Promise<Delivery> {
+  const result = await postChatForm("/api/conversations/text", {
+    message: source.text,
+    source_language: source.language,
+    source_style: source.style,
+    target_language: target.language,
+    target_style: target.style,
+  }, signal);
+  if (typeof result.translation !== "string" || !result.translation.trim() ||
+      typeof result.speech_text !== "string" || !result.speech_text.trim()) throw new Error("Translation returned no text.");
+  return { ...target, status: "ready", text: target.text ?? result.translation, speechText: result.speech_text };
 }
 
 function Bubble({ side, delivery }: { side: Side; delivery: Delivery }) {
@@ -63,42 +78,56 @@ export default function HumanChat() {
     return () => document.removeEventListener("mousedown", close);
   }, []);
 
-  function deliver(turn: Turn, side: Side) {
-    const target = turn[side];
-    if (!target || target.status === "ready") return;
-    void run(turn.id + ":" + side, async (signal) => {
-      const save = (delivery: Delivery) => updateConversation((data) => ({
+  function deliver(turn: Turn) {
+    if (turn.owner.status === "ready") return;
+    void run(turn.id, async (signal) => {
+      const save = (owner: Delivery, other?: Delivery) => updateConversation((data) => ({
         ...data,
-        turns: data.turns.map((item) => item.id === turn.id ? { ...item, [side]: delivery } : item),
+        turns: data.turns.map((item) => item.id === turn.id ? { ...item, owner, other } : item),
       }));
-      save({ ...target, status: "pending" });
+      const owner = { ...turn.owner, status: "pending" as const };
+      let other = turn.other;
+      save(owner, other);
       try {
-        const result = await postChatForm("/api/conversations/text", {
-          message: turn.source.text,
-          source_language: turn.source.language,
-          source_style: turn.source.style,
-          target_language: target.language,
-          target_style: target.style,
-        }, signal);
-        if (typeof result.translation !== "string" || !result.translation.trim() ||
-            typeof result.speech_text !== "string" || !result.speech_text.trim()) throw new Error("Translation returned no text.");
-        if (!signal.aborted) save({ ...target, status: "ready", text: target.text ?? result.translation, speechText: result.speech_text });
+        if (!other) {
+          const incoming = await translate(turn.source, owner, signal);
+          if (!signal.aborted) save(incoming);
+          return;
+        }
+        // The opposite bubble and both speaker buttons use the same native translation.
+        if (other.status !== "ready") other = await translate(turn.source, other, signal);
+        if (signal.aborted) return;
+        if (!other.text) throw new Error("Translation returned no text.");
+        const script = readingScript(owner.style);
+        let text = other.text;
+        if (script !== readingScript(other.style)) {
+          save(owner, other);
+          const result = await postChatForm("/api/conversations/pronunciation", {
+            message: other.text,
+            language: other.language,
+            script,
+          }, signal);
+          if (typeof result.pronunciation !== "string" || !result.pronunciation.trim()) throw new Error("Pronunciation returned no text.");
+          text = result.pronunciation;
+        }
+        if (!signal.aborted) save({ ...owner, status: "ready", text, speechText: other.speechText }, other);
       } catch {
-        if (!signal.aborted) save({ ...target, status: "failed" });
+        if (!signal.aborted) save({ ...owner, status: "failed" }, other);
       }
     });
   }
 
   function addTurn(capture: Capture, text: string, fromMic: boolean) {
     const source = { text, language: capture.language, style: capture.style };
-    const turn: Turn = {
-      id: crypto.randomUUID(), speaker: capture.speaker, source,
-      owner: deliveryFor(source, capture.chat),
-      other: capture.speaker === "owner" ? deliveryFor(source, capture.partner) : undefined,
-    };
+    const other = capture.speaker === "owner" ? deliveryFor(source, capture.partner) : undefined;
+    const owner: Delivery = other
+      ? readingScript(capture.chat.value) === readingScript(other.style)
+        ? { ...other, style: capture.chat.value }
+        : { style: capture.chat.value, language: other.language, status: "pending" }
+      : deliveryFor(source, capture.chat);
+    const turn: Turn = { id: crypto.randomUUID(), source, owner, other };
     updateConversation((data) => ({ ...data, turns: [...data.turns, turn], capture: fromMic ? undefined : data.capture }));
-    deliver(turn, "owner");
-    deliver(turn, "other");
+    deliver(turn);
   }
 
   const voice = useVoiceCapture<Capture>(
@@ -168,13 +197,11 @@ export default function HumanChat() {
     <section className="conversation-area owner-area" aria-label="Your conversation area">
       <div className="bubbles-container owner-bubbles">
         {turns.map((turn) => {
-          const unfinished = (["owner", "other"] as const).filter((side) => turn[side] && turn[side].status !== "ready");
-          const retryable = unfinished.filter((side) => !inFlight.has(turn.id + ":" + side));
           return <div className="human-turn" key={turn.id}>
             <Bubble side="owner" delivery={turn.owner} />
-            {unfinished.length > 0 && <div className="translation-retry" role="status">
-              {retryable.length > 0 ? <><span>Translation unavailable.</span><button type="button"
-                onClick={() => retryable.forEach((side) => deliver(turn, side))}>Retry translation</button></> : "Translating…"}
+            {turn.owner.status !== "ready" && <div className="translation-retry" role="status">
+              {inFlight.has(turn.id) ? "Translating…" : <><span>Translation unavailable.</span><button type="button"
+                onClick={() => deliver(turn)}>Retry translation</button></>}
             </div>}
           </div>;
         })}

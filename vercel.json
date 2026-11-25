@@ -1,4 +1,11 @@
 {
+    "headers": [
+        { "source": "/", "headers": [{ "key": "Cache-Control", "value": "no-store" }] },
+        { "source": "/index.html", "headers": [{ "key": "Cache-Control", "value": "no-store" }] },
+        { "source": "/human", "headers": [{ "key": "Cache-Control", "value": "no-store" }] },
+        { "source": "/ai", "headers": [{ "key": "Cache-Control", "value": "no-store" }] },
+        { "source": "/sw.js", "headers": [{ "key": "Cache-Control", "value": "no-store" }] }
+    ],
     "rewrites": [
         {
             "source": "/api/:path*",

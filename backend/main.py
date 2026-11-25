@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import wave
 from dataclasses import dataclass
@@ -43,6 +44,10 @@ ROMAN_STYLES = {"Tenglish", "Hinglish", "Kanglish", "Tanglish"}
 STYLE_LANGUAGE_CODES = {"Telugu": "te-IN", "Tenglish": "te-IN", "Hindi": "hi-IN", "Hinglish": "hi-IN", "Kannada": "kn-IN", "Kanglish": "kn-IN", "Tamil": "ta-IN", "Tanglish": "ta-IN", "English": "en-IN"}
 LANGUAGE_NAMES = {"en-IN": "English", "te-IN": "Telugu", "kn-IN": "Kannada", "hi-IN": "Hindi", "ta-IN": "Tamil"}
 NATIVE_SCRIPT_RANGES = {"Tenglish": (0x0C00, 0x0C7F), "Hinglish": (0x0900, 0x097F), "Kanglish": (0x0C80, 0x0CFF), "Tanglish": (0x0B80, 0x0BFF)}
+READING_SCRIPTS = {"Latin": "en-IN", **{name: language for language, name in LANGUAGE_NAMES.items() if language != "en-IN"}}
+ROMAN_STYLE_BY_LANGUAGE = {STYLE_LANGUAGE_CODES[style]: style for style in ROMAN_STYLES}
+HINDI_REGISTER = " For Hindi address, use तुम/तुम्हारा for ordinary familiar singular speech and आप/आपका for respectful speech. Reserve तू for explicitly intimate or rude speech."
+ROMAN_VOWELS = " Use readable spellings. For a name without a supplied Latin spelling, write long ee and oo sounds with doubled vowels, but use the conventional single final a in names ending in a (for example, Deepika, rather than Dipikaa). Keep a Latin spelling supplied by the speaker."
 BOT_LOGGER = logging.getLogger("language_friend.bot_reply")
 
 @dataclass(frozen=True)
@@ -176,10 +181,12 @@ async def gemini_bot_reply(contents: list[dict], style: str, deadline: float, ma
 
 def translation_instruction(target_style: str, roman_output: bool) -> str:
     base = f"Translate the message faithfully for a live two-person conversation. Preserve the speaker's intent, quantities, prices, and whether an action is stated. A desire, need, request, or availability statement is not a purchase action. Do not infer a transaction from an item, packet, shop context, or price; use buy or purchase wording only when the source explicitly states that action. Preserve the speaker's level of respect and number in forms of address. Respect may be carried by the verb ending even when a pronoun is omitted: do not turn familiar singular speech into respectful or plural speech, or vice versa. Use natural target-language pronouns and matching verb forms. Use everyday wording and keep natural loanwords where appropriate. {style_instruction(target_style)}"
+    if STYLE_LANGUAGE_CODES.get(target_style) == "hi-IN":
+        base += HINDI_REGISTER
     if not roman_output:
         return f"{base} Return only the translated message, with no notes or quotation marks."
     native = {"Tenglish": "Telugu", "Hinglish": "Hindi", "Kanglish": "Kannada", "Tanglish": "Tamil"}[target_style]
-    return f'{base} First write the idiomatic {native} translation in its native script for "speech_text". Then transliterate those exact words into Latin script for "display". Return only a JSON object with these two string fields. Use everyday target-language forms rather than copying similar-looking source words or pronouns.'
+    return f'{base} First write the idiomatic {native} translation in its native script for "speech_text". Then transliterate those exact words into Latin script for "display". Return only a JSON object with these two string fields. Use everyday target-language forms rather than copying similar-looking source words or pronouns.{ROMAN_VOWELS}'
 
 def transliteration_instruction(source_style: str, target_style: str) -> str:
     base = (
@@ -339,9 +346,11 @@ def sarvam_chat_instruction(source_language: str, target_style: str, roman_outpu
     source = LANGUAGE_NAMES[source_language]
     target = {"Tenglish": "Telugu", "Hinglish": "Hindi", "Kanglish": "Kannada", "Tanglish": "Tamil"}.get(target_style, target_style)
     base = f"Translate only the user's message from {source} to {target} for a live two-person conversation. Do not answer the message. Preserve its meaning, quantities, prices, actions, second-person number, and level of respect exactly. Familiar and respectful address are different meanings. The source may encode this only in a verb ending; retain the matching target-language verb ending and do not make it more formal. {style_instruction(target_style)}"
+    if STYLE_LANGUAGE_CODES.get(target_style) == "hi-IN":
+        base += HINDI_REGISTER
     if not roman_output: return f"{base} Return only the translation, with no explanation or quotation marks."
     native = {"Tenglish": "Telugu", "Hinglish": "Hindi", "Kanglish": "Kannada", "Tanglish": "Tamil"}[target_style]
-    return f'{base} First write the idiomatic {native} translation in its native script, using everyday target-language forms rather than copying similar-looking source words or pronouns. Transliterate those exact words for display. Return only a JSON object: {{"speech_text":"the translation in native {native} script","display":"those exact words in Latin script"}}.'
+    return f'{base} First write the idiomatic {native} translation in its native script, using everyday target-language forms rather than copying similar-looking source words or pronouns. Transliterate those exact words for display.{ROMAN_VOWELS} Return only a JSON object: {{"speech_text":"the translation in native {native} script","display":"those exact words in Latin script"}}.'
 
 async def sarvam_chat_translation(message: str, source_language: str, target_style: str, deadline: float, instruction: str | None = None) -> TranslationResult:
     """Instruction-following translation fallback; never used for AI Bot replies."""
@@ -369,19 +378,24 @@ async def sarvam_chat_translation(message: str, source_language: str, target_sty
     return translation_result(translated, roman_output, provider="sarvam-chat")
 
 
-async def sarvam_transliterate_bot_reply(text: str, source_language: str, target_language: str, style: str, deadline: float) -> str:
-    """Use Sarvam's documented native<->English transliteration directions for a repaired Roman pair."""
+async def sarvam_transliteration_response(text: str, source_language: str, target_language: str, timeout: float) -> httpx.Response:
     key = required("SARVAM_API_KEY")
-    timeout = remaining_bot_reply_time(deadline, SARVAM_ROMAN_RECOVERY_SECONDS)
     payload = {
         "input": text,
         "source_language_code": source_language,
         "target_language_code": target_language,
         "numerals_format": "international",
     }
+    async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
+        async with asyncio.timeout(timeout):
+            return await client.post(os.getenv("SARVAM_TRANSLITERATE_URL", SARVAM_TRANSLITERATE_URL), headers={"api-subscription-key": key}, json=payload)
+
+
+async def sarvam_transliterate_bot_reply(text: str, source_language: str, target_language: str, style: str, deadline: float) -> str:
+    """Use Sarvam's documented native<->English transliteration directions for a repaired Roman pair."""
+    timeout = remaining_bot_reply_time(deadline, SARVAM_ROMAN_RECOVERY_SECONDS)
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
-            async with asyncio.timeout(timeout): response = await client.post(os.getenv("SARVAM_TRANSLITERATE_URL", SARVAM_TRANSLITERATE_URL), headers={"api-subscription-key": key}, json=payload)
+        response = await sarvam_transliteration_response(text, source_language, target_language, timeout)
     except (TimeoutError, httpx.RequestError) as error:
         bot_reply_diagnostic("sarvam-transliterate", style, "transport", outcome="error", error_type=type(error).__name__, direction=f"{source_language}->{target_language}")
         raise HTTPException(503, "AI reply services are temporarily unavailable. Retry reply.") from None
@@ -548,6 +562,82 @@ async def translate_conversation(message: str, source_language: str, source_styl
     if result and usable(result): return result
     raise HTTPException(502, "Translation could not preserve the original amounts or writing script. Please retry.")
 
+
+async def render_pronunciation(message: str, language: str, script: str) -> str:
+    """Write the already-translated words in a different script, keeping their language."""
+    script_language = READING_SCRIPTS[script]
+    if language == script_language or not any(character.isalpha() for character in message):
+        return message
+    amounts = protect_amounts(message, language)
+    if not amounts.contains_words:
+        return amounts.restore(amounts.text) or message
+    deadline = time.monotonic() + TRANSLATION_BUDGET_SECONDS
+    has_sarvam = bool(os.getenv("SARVAM_API_KEY"))
+
+    def in_requested_script(text: str | None) -> bool:
+        if script == "Latin":
+            return roman_text_is_valid(text)
+        return native_text_is_valid(text, ROMAN_STYLE_BY_LANGUAGE[script_language]) and not contains_latin(text or "")
+
+    def accepted(text: str) -> str | None:
+        # Script conversion keeps the canonical wording. Reject obvious additions,
+        # omissions or changes to question/exclamation marks before using a provider.
+        def word_count(value: str) -> int:
+            return sum(any(char.isalnum() for char in part) for part in value.split())
+
+        display = amounts.restore(text)
+        if display and in_requested_script(display) and word_count(text) == word_count(amounts.text) and re.findall(r"[?!]", text) == re.findall(r"[?!]", amounts.text):
+            return formatted(display)
+        return None
+
+    def formatted(text: str) -> str:
+        if script != "Telugu":
+            return text
+        # Unlike a blended onset, two different stops usually span a syllable
+        # boundary. Unjoin the first stop so it remains readable as a coda.
+        return re.sub(r"([కఖగఘచఛజఝటఠడఢతథదధపఫబభ])్[\u200b\u200c\u200d]?(?=(?!\1)[కఖగఘచఛజఝటఠడఢతథదధపఫబభ])", r"\1్‌", text)
+
+    # The dedicated API documents Latin-to-Indic and Indic-to-Latin.
+    # Keep amounts protected with markers on the instruction-following path.
+    if has_sarvam and "en-IN" in (language, script_language) and len(message) <= 1000 and not amounts.replacements:
+        try:
+            response = await sarvam_transliteration_response(message, language, script_language, remaining_translation_time(deadline, 7.0))
+            if response.is_success:
+                display = accepted(response.json()["transliterated_text"].strip())
+                if display:
+                    return display
+        except (TimeoutError, httpx.RequestError, KeyError, AttributeError, TypeError, ValueError):
+            pass
+
+    instruction = (
+        f"The input is already in {LANGUAGE_NAMES[language]}. This is a pronunciation guide, not a translation. "
+        f"Write those same spoken words using only {script} letters. Keep the words and their order, names, register, "
+        "pacing, and punctuation. Do not translate, paraphrase, answer, or change the level of respect. "
+        "Use natural spoken pronunciation, including vowel length and consonants at the ends of syllables. "
+        "For Telugu script use a virama with a zero-width non-joiner to show a syllable-final consonant "
+        "before a new syllable; retain normal conjuncts within a syllable. Return only the pronunciation guide."
+    )
+    if amounts.replacements:
+        instruction += AMOUNT_INSTRUCTION
+    style = LANGUAGE_NAMES[script_language]  # Both providers must return plain text, even for Latin letters.
+    if has_sarvam:
+        primary = await gemini_translation(amounts.text, style, deadline, instruction)
+        if primary:
+            display = accepted(primary.display)
+            if display:
+                return display
+        fallback = await sarvam_chat_translation(amounts.text, language, style, deadline, instruction)
+        output = fallback.display
+    else:
+        output = await gemini(
+            [{"role": "user", "parts": [{"text": amounts.text}]}], instruction,
+            timeout=httpx.Timeout(remaining_translation_time(deadline, TRANSLATION_BUDGET_SECONDS)),
+        )
+    display = accepted(output)
+    if display:
+        return display
+    raise HTTPException(502, "Pronunciation could not preserve the requested script or amounts. Please retry.")
+
 def style_instruction(style: str) -> str:
     if style in {"Tenglish", "Hinglish", "Kanglish", "Tanglish"}:
         base = {"Tenglish": "Telugu", "Hinglish": "Hindi", "Kanglish": "Kannada", "Tanglish": "Tamil"}[style]
@@ -596,6 +686,14 @@ async def text_turn(message: str = Form(...), source_language: str = Form(...), 
     if not message.strip(): raise HTTPException(422, "Message cannot be empty.")
     translation = await translate_conversation(message.strip(), source_language, source_style, target_language, target_style)
     return {"translation": translation.display, "speech_text": translation.speech_text, "provider": translation.provider, "target_language": target_language, "target_style": target_style}
+
+@app.post("/api/conversations/pronunciation")
+async def pronunciation_turn(message: str = Form(...), language: str = Form(...), script: str = Form(...)):
+    if language not in SUPPORTED_LANGUAGE_CODES or script not in READING_SCRIPTS:
+        raise HTTPException(422, "Unsupported pronunciation language or script.")
+    if not message.strip():
+        raise HTTPException(422, "Message cannot be empty.")
+    return {"pronunciation": await render_pronunciation(message.strip(), language, script)}
 
 @app.post("/api/transcribe")
 async def transcribe(audio: UploadFile = File(...), language: str = Form(...)):

@@ -3,10 +3,12 @@ import { useSettings, type Theme } from "./SettingsProvider";
 import { useState, useRef, useEffect } from "react";
 import { CHAT_LANGUAGES, SPOKEN_LANGUAGES } from "../languages";
 import { useChatHistory } from "../chatHistory";
+import { useInstallPrompt } from "../pwa";
 
 export default function Header({ onNewHumanChat }: { onNewHumanChat: () => void }) {
   const navigate = useNavigate();
   const { conversations, startNewConversation, openConversation, activeConversation } = useChatHistory();
+  const { canInstall, showSafariGuidance, install } = useInstallPrompt();
   const { spokenLanguage, setSpokenLanguage, chatLanguage, setChatLanguage, theme, setTheme } = useSettings();
   const [showNewChatMenu, setShowNewChatMenu] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
@@ -88,6 +90,10 @@ export default function Header({ onNewHumanChat }: { onNewHumanChat: () => void 
 
         {showSettings && (
           <div className="dropdown-panel right-panel">
+            {(canInstall || showSafariGuidance) && <div className="settings-section">
+              {canInstall && <button type="button" className="header-btn" onClick={install}>Install Language Friend</button>}
+              {showSafariGuidance && <p className="install-guidance">To install Language Friend, tap <strong>Share → Add to Home Screen</strong> in Safari.</p>}
+            </div>}
             <div className="settings-section">
               <span className="settings-label" id="history-label">History</span>
               {conversations.length === 0 ? <div className="empty-state">No saved AI Bot chats yet</div> :

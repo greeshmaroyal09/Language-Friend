@@ -102,3 +102,49 @@ class HumanTranslationTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(main.HTTPException) as failure:
                 await main.translate_conversation("ನನಗೆ ನೀರು ಬೇಕು", "kn-IN", "Kannada", "te-IN", "Telugu")
         self.assertEqual(failure.exception.status_code, 502)
+
+
+class PronunciationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_hindi_to_latin_transliterates_the_original_words(self):
+        direct = AsyncMock(side_effect=[
+            main.httpx.Response(200, json={"transliterated_text": "Aapka naam kya hai?"}),
+            main.httpx.Response(200, json={"transliterated_text": "Tumhara naam kya hai?"}),
+        ])
+        with patch.dict(os.environ, {"SARVAM_API_KEY": "test"}), patch("main.sarvam_transliteration_response", direct):
+            self.assertEqual(await main.render_pronunciation("आपका नाम क्या है?", "hi-IN", "Latin"), "Aapka naam kya hai?")
+            self.assertEqual(await main.render_pronunciation("तुम्हारा नाम क्या है?", "hi-IN", "Latin"), "Tumhara naam kya hai?")
+        self.assertEqual([call.args[:3] for call in direct.await_args_list], [
+            ("आपका नाम क्या है?", "hi-IN", "en-IN"), ("तुम्हारा नाम क्या है?", "hi-IN", "en-IN"),
+        ])
+
+    async def test_native_reading_script_and_amount_use_canonical_input(self):
+        canonical = "आपके 35 रुपये चाहिए?"
+        gemini = AsyncMock(return_value=main.TranslationResult("ఆప్\u200bకే [LFQAA] రూపయే చాహియే?", ""))
+        with patch.dict(os.environ, {"SARVAM_API_KEY": "test"}), patch("main.gemini_translation", gemini):
+            result = await main.render_pronunciation(canonical, "hi-IN", "Telugu")
+        self.assertEqual(result, "ఆప్‌కే 35 రూపయే చాహియే?")
+        source, target, _, instruction = gemini.call_args.args
+        self.assertEqual(source, "आपके [LFQAA] रुपये चाहिए?")
+        self.assertEqual(target, "Telugu")
+        self.assertIn("already in Hindi", instruction)
+        self.assertIn("Do not translate", instruction)
+
+    async def test_rejects_added_words_before_trying_fallback(self):
+        response = main.httpx.Response(200, json={"transliterated_text": "Mane hanu haalu beku"})
+        gemini = AsyncMock(return_value=main.TranslationResult("Nanage haalu beku", ""))
+        with patch.dict(os.environ, {"SARVAM_API_KEY": "test"}), patch("main.sarvam_transliteration_response", return_value=response), patch("main.gemini_translation", gemini):
+            result = await main.render_pronunciation("ನನಗೆ ಹಾಲು ಬೇಕು", "kn-IN", "Latin")
+        self.assertEqual(result, "Nanage haalu beku")
+        gemini.assert_awaited_once()
+
+    async def test_same_script_does_not_call_a_provider(self):
+        with patch("main.gemini_translation", side_effect=AssertionError("Unneeded request")):
+            self.assertEqual(await main.render_pronunciation("आपका नाम क्या है?", "hi-IN", "Hindi"), "आपका नाम क्या है?")
+            self.assertEqual(await main.render_pronunciation("What is your name?", "en-IN", "Latin"), "What is your name?")
+
+    def test_endpoint_rejects_invalid_script(self):
+        from fastapi.testclient import TestClient
+
+        with TestClient(main.app) as client:
+            response = client.post("/api/conversations/pronunciation", data={"message": "Hello", "language": "en-IN", "script": "Unknown"})
+        self.assertEqual(response.status_code, 422)
