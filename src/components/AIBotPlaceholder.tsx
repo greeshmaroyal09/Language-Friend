@@ -13,6 +13,7 @@ type Turn = {
   request: { style: string; language: string; history: HistoryMessage[] };
   status: "pending" | "ready" | "failed";
   reply?: Reply;
+  error?: string;
 };
 type BotConversation = { turns: Turn[]; capture?: Capture };
 
@@ -33,10 +34,10 @@ export default function AIBotPlaceholder({ conversation }: { conversation: Store
   function requestReply(turn: Turn) {
     if (turn.status === "ready") return;
     void run(turn.id, async (signal) => {
-      const save = (patch: Pick<Turn, "status" | "reply">) => update((data) => ({
+      const save = (patch: Pick<Turn, "status" | "reply" | "error">) => update((data) => ({
         ...data, turns: data.turns.map((item) => item.id === turn.id ? { ...item, ...patch } : item),
       }));
-      save({ status: "pending" });
+      save({ status: "pending", error: undefined });
       try {
         const result = await postChatForm("/api/bot/reply", {
           message: turn.source.text, style: turn.request.style, history: JSON.stringify(turn.request.history),
@@ -44,6 +45,7 @@ export default function AIBotPlaceholder({ conversation }: { conversation: Store
         if (typeof result.reply !== "string" || !result.reply.trim()) throw new Error("AI Bot returned no reply.");
         if (!signal.aborted) save({
           status: "ready",
+          error: undefined,
           reply: {
             text: result.reply,
             speechText: result.speech_text || result.reply,
@@ -51,8 +53,11 @@ export default function AIBotPlaceholder({ conversation }: { conversation: Store
             style: turn.request.style,
           },
         });
-      } catch {
-        if (!signal.aborted) save({ status: "failed" });
+      } catch (cause) {
+        if (!signal.aborted) save({
+          status: "failed",
+          error: cause instanceof Error ? cause.message : "AI Bot could not reply.",
+        });
       }
     });
   }
@@ -88,7 +93,7 @@ export default function AIBotPlaceholder({ conversation }: { conversation: Store
             <small>You</small><span>{turn.source.text}</span>
             {turn.status !== "ready" && <div className="translation-retry" role="status">
               {inFlight.has(turn.id) ? "AI Bot is replying…" : <>
-                <span>{turn.status === "pending" ? "Reply was interrupted." : "AI Bot could not reply."}</span>
+                <span>{turn.status === "pending" ? "Reply was interrupted." : turn.error || "AI Bot could not reply."}</span>
                 <button type="button" disabled={busy || Boolean(voice.recording)} onClick={() => requestReply(turn)}>Retry reply</button>
               </>}
             </div>}

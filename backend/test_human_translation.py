@@ -40,11 +40,24 @@ class HumanTranslationTests(unittest.IsolatedAsyncioTestCase):
         result = await main.translate_conversation("ముప్పై ఐదు", "te-IN", "Telugu", "te-IN", "Tenglish")
         self.assertEqual((result.display, result.speech_text, result.provider), ("35", "ముప్పై ఐదు", "local"))
 
+    async def test_no_language_provider_reports_configuration(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(main.HTTPException, "Translation is not configured") as failure:
+                await main.translate_conversation("Hello", "en-IN", "English", "te-IN", "Telugu")
+        self.assertEqual(failure.exception.status_code, 503)
+
+    async def test_sarvam_can_translate_without_gemini(self):
+        fallback = AsyncMock(return_value=main.TranslationResult("Hello", "Hello", provider="sarvam-chat"))
+        with patch.dict(os.environ, {"SARVAM_API_KEY": "test"}, clear=True), patch("main.sarvam_chat_translation", fallback):
+            result = await main.translate_conversation("Hello", "en-IN", "English", "en-IN", "English")
+        self.assertEqual(result.provider, "sarvam-chat")
+        fallback.assert_awaited_once()
+
     async def test_35_rupees_survives_a_provider_dropping_the_five(self):
         source = "మీకు కావాల్సిన పాలు packet ముప్పై ఐదు రూపాయలు"
         primary = AsyncMock(return_value=main.TranslationResult("Meeku kaavalsina paalu packet muppai roopaayalu", source))
         fallback = AsyncMock(return_value=main.TranslationResult("Meeku kaavalsina paalu packet [LFQAA] roopaayalu", "మీకు కావాల్సిన పాలు ప్యాకెట్ [LFQAA] రూపాయలు"))
-        with patch.dict(os.environ, {"SARVAM_API_KEY": "test"}), patch("main.gemini_translation", primary), patch("main.sarvam_chat_translation", fallback):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test", "SARVAM_API_KEY": "test"}), patch("main.gemini_translation", primary), patch("main.sarvam_chat_translation", fallback):
             result = await main.translate_conversation(source, "te-IN", "Telugu", "te-IN", "Tenglish")
         masked, _, _, prompt = primary.call_args.args
         self.assertIn("packet [LFQAA] రూపాయలు", masked)
@@ -59,7 +72,7 @@ class HumanTranslationTests(unittest.IsolatedAsyncioTestCase):
             "display": "[LFQAA] packetlu [LFQAB] roopaayalu",
             "speech_text": "రెండు ప్యాకెట్లు ముప్పై రూపాయలు",
         }))
-        with patch.dict(os.environ, {"SARVAM_API_KEY": ""}), patch("main.gemini", bad_pair):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test", "SARVAM_API_KEY": ""}), patch("main.gemini", bad_pair):
             with self.assertRaisesRegex(main.HTTPException, "original amounts"):
                 await main.translate_conversation(source, "en-IN", "English", "te-IN", "Tenglish")
 
@@ -69,7 +82,7 @@ class HumanTranslationTests(unittest.IsolatedAsyncioTestCase):
             "display": "Naaku paalu kaavali",
             "speech_text": "నాకు పాలు అవసరం",
         }))
-        with patch.dict(os.environ, {"SARVAM_API_KEY": ""}), patch("main.gemini", gemini):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test", "SARVAM_API_KEY": ""}), patch("main.gemini", gemini):
             result = await main.translate_conversation(source, "te-IN", "Telugu", "te-IN", "Tenglish")
         self.assertEqual(result.display, "Naaku paalu kaavali")
         self.assertEqual(result.speech_text, source)
@@ -80,7 +93,7 @@ class HumanTranslationTests(unittest.IsolatedAsyncioTestCase):
         source = "Naaku PAALU kaavali!"
         native = "నాకు పాలు కావాలి!"
         gemini = AsyncMock(return_value=native)
-        with patch.dict(os.environ, {"SARVAM_API_KEY": ""}), patch("main.gemini", gemini):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test", "SARVAM_API_KEY": ""}), patch("main.gemini", gemini):
             roman = await main.translate_conversation(source, "te-IN", "Tenglish", "te-IN", "Tenglish")
             converted = await main.translate_conversation(source, "te-IN", "Tenglish", "te-IN", "Telugu")
         self.assertEqual((roman.display, roman.speech_text), (source, native))
@@ -91,14 +104,14 @@ class HumanTranslationTests(unittest.IsolatedAsyncioTestCase):
         native = "నాకు నీళ్లు కావాలి"
         primary = AsyncMock(return_value=main.TranslationResult(native, native))
         fallback = AsyncMock(return_value=main.TranslationResult("Naaku neellu kaavali", native))
-        with patch.dict(os.environ, {"SARVAM_API_KEY": "test"}), patch("main.gemini_translation", primary), patch("main.sarvam_chat_translation", fallback):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test", "SARVAM_API_KEY": "test"}), patch("main.gemini_translation", primary), patch("main.sarvam_chat_translation", fallback):
             result = await main.translate_conversation(source, "kn-IN", "Kannada", "te-IN", "Tenglish")
         fallback.assert_awaited_once_with(source, "kn-IN", "Tenglish", ANY, None)
         self.assertEqual((result.display, result.speech_text), ("Naaku neellu kaavali", native))
 
     async def test_wrong_native_script_fails_after_fallback(self):
         wrong = AsyncMock(return_value=main.TranslationResult("Naaku neellu kaavali", "Naaku neellu kaavali"))
-        with patch.dict(os.environ, {"SARVAM_API_KEY": "test"}), patch("main.gemini_translation", wrong), patch("main.sarvam_chat_translation", wrong):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test", "SARVAM_API_KEY": "test"}), patch("main.gemini_translation", wrong), patch("main.sarvam_chat_translation", wrong):
             with self.assertRaises(main.HTTPException) as failure:
                 await main.translate_conversation("ನನಗೆ ನೀರು ಬೇಕು", "kn-IN", "Kannada", "te-IN", "Telugu")
         self.assertEqual(failure.exception.status_code, 502)
@@ -120,7 +133,7 @@ class PronunciationTests(unittest.IsolatedAsyncioTestCase):
     async def test_native_reading_script_and_amount_use_canonical_input(self):
         canonical = "आपके 35 रुपये चाहिए?"
         gemini = AsyncMock(return_value=main.TranslationResult("ఆప్\u200bకే [LFQAA] రూపయే చాహియే?", ""))
-        with patch.dict(os.environ, {"SARVAM_API_KEY": "test"}), patch("main.gemini_translation", gemini):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test", "SARVAM_API_KEY": "test"}), patch("main.gemini_translation", gemini):
             result = await main.render_pronunciation(canonical, "hi-IN", "Telugu")
         self.assertEqual(result, "ఆప్‌కే 35 రూపయే చాహియే?")
         source, target, _, instruction = gemini.call_args.args
@@ -132,7 +145,7 @@ class PronunciationTests(unittest.IsolatedAsyncioTestCase):
     async def test_rejects_added_words_before_trying_fallback(self):
         response = main.httpx.Response(200, json={"transliterated_text": "Mane hanu haalu beku"})
         gemini = AsyncMock(return_value=main.TranslationResult("Nanage haalu beku", ""))
-        with patch.dict(os.environ, {"SARVAM_API_KEY": "test"}), patch("main.sarvam_transliteration_response", return_value=response), patch("main.gemini_translation", gemini):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test", "SARVAM_API_KEY": "test"}), patch("main.sarvam_transliteration_response", return_value=response), patch("main.gemini_translation", gemini):
             result = await main.render_pronunciation("ನನಗೆ ಹಾಲು ಬೇಕು", "kn-IN", "Latin")
         self.assertEqual(result, "Nanage haalu beku")
         gemini.assert_awaited_once()

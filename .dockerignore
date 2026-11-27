@@ -1,0 +1,38 @@
+# Credentials and local configuration
+.env
+.env.*
+**/.env
+**/.env.*
+
+# Dependency folders and generated output
+.git/
+node_modules/
+**/node_modules/
+dist/
+dist-ssr/
+**/dist/
+**/dist-ssr/
+.venv/
+.venv*/
+**/.venv/
+**/.venv*/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# The frontend image does not need backend sources or browser tests.
+backend/
+tests/
+
+# Local recordings, logs, and caches
+*.log
+*.wav
+*.webm
+*.ogg
+*.recording.wav
+*.recording.webm
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+tmp/
+recordings/
