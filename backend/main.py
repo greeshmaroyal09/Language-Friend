@@ -11,7 +11,7 @@ from io import BytesIO
 from pathlib import Path
 
 import httpx
-from dotenv import dotenv_values, load_dotenv
+from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
@@ -19,7 +19,6 @@ from audio import normalize_gnani_wav
 from amounts import AMOUNT_INSTRUCTION, protect_amounts
 
 ENV_PATH = Path(__file__).resolve().parent / ".env"
-ENV_VALUES = dotenv_values(ENV_PATH)
 # Always use the saved backend configuration rather than a stale parent-process value.
 load_dotenv(ENV_PATH, override=True)
 app = FastAPI(title="Language Friend voice API")
@@ -74,6 +73,18 @@ def required(name: str) -> str:
     if not value:
         raise HTTPException(503, f"{name} is not configured on the backend.")
     return value
+
+
+def configured(name: str) -> bool:
+    """Treat an empty Compose environment value as not configured."""
+    return bool(os.getenv(name))
+
+
+def provider_configuration_error(feature: str) -> HTTPException:
+    return HTTPException(
+        503,
+        f"{feature} is not configured on the backend. Set GEMINI_API_KEY or SARVAM_API_KEY and restart the backend.",
+    )
 
 def validate_audio(data: bytes) -> None:
     try:
@@ -544,7 +555,12 @@ async def translate_conversation(message: str, source_language: str, source_styl
             )
         return roman_text_is_valid(result.display) and roman_text_is_valid(result.speech_text)
 
-    if not os.getenv("SARVAM_API_KEY"):
+    has_gemini = configured("GEMINI_API_KEY")
+    has_sarvam = configured("SARVAM_API_KEY")
+    if not has_gemini and not has_sarvam:
+        raise provider_configuration_error("Translation")
+
+    if has_gemini and not has_sarvam:
         translated = await gemini(
             [{"role": "user", "parts": [{"text": amounts.text}]}],
             gemini_instruction or translation_instruction(target_style, roman_output),
@@ -554,10 +570,11 @@ async def translate_conversation(message: str, source_language: str, source_styl
         raise HTTPException(502, "Translation could not preserve the original amounts or writing script. Please retry.")
 
     deadline = time.monotonic() + TRANSLATION_BUDGET_SECONDS
-    primary = await gemini_translation(amounts.text, provider_style, deadline, gemini_instruction)
-    if primary:
-        result = finish(primary)
-        if result and usable(result): return result
+    if has_gemini:
+        primary = await gemini_translation(amounts.text, provider_style, deadline, gemini_instruction)
+        if primary:
+            result = finish(primary)
+            if result and usable(result): return result
     result = finish(await sarvam_chat_translation(amounts.text, source_language, provider_style, deadline, fallback_instruction))
     if result and usable(result): return result
     raise HTTPException(502, "Translation could not preserve the original amounts or writing script. Please retry.")
@@ -572,7 +589,8 @@ async def render_pronunciation(message: str, language: str, script: str) -> str:
     if not amounts.contains_words:
         return amounts.restore(amounts.text) or message
     deadline = time.monotonic() + TRANSLATION_BUDGET_SECONDS
-    has_sarvam = bool(os.getenv("SARVAM_API_KEY"))
+    has_gemini = configured("GEMINI_API_KEY")
+    has_sarvam = configured("SARVAM_API_KEY")
 
     def in_requested_script(text: str | None) -> bool:
         if script == "Latin":
@@ -621,18 +639,22 @@ async def render_pronunciation(message: str, language: str, script: str) -> str:
         instruction += AMOUNT_INSTRUCTION
     style = LANGUAGE_NAMES[script_language]  # Both providers must return plain text, even for Latin letters.
     if has_sarvam:
-        primary = await gemini_translation(amounts.text, style, deadline, instruction)
+        primary = None
+        if has_gemini:
+            primary = await gemini_translation(amounts.text, style, deadline, instruction)
         if primary:
             display = accepted(primary.display)
             if display:
                 return display
         fallback = await sarvam_chat_translation(amounts.text, language, style, deadline, instruction)
         output = fallback.display
-    else:
+    elif has_gemini:
         output = await gemini(
             [{"role": "user", "parts": [{"text": amounts.text}]}], instruction,
             timeout=httpx.Timeout(remaining_translation_time(deadline, TRANSLATION_BUDGET_SECONDS)),
         )
+    else:
+        raise provider_configuration_error("Pronunciation")
     display = accepted(output)
     if display:
         return display
@@ -668,9 +690,22 @@ def validate_language(language: str, style: str) -> None:
 
 @app.get("/api/health")
 async def health():
-    required_names = ("GNANI_API_KEY", "GNANI_STT_URL", "GNANI_TTS_URL", "GEMINI_API_KEY")
-    provider_names = (*required_names, "SARVAM_API_KEY")
-    return {"ok": True, "configured": all(os.getenv(name) for name in required_names), "providers": {name: bool(os.getenv(name)) for name in provider_names}, "environment": {"gemini_key_matches_backend_env": bool(ENV_VALUES.get("GEMINI_API_KEY")) and os.getenv("GEMINI_API_KEY") == ENV_VALUES.get("GEMINI_API_KEY")}}
+    provider_names = ("GNANI_API_KEY", "GNANI_STT_URL", "GNANI_TTS_URL", "GEMINI_API_KEY", "SARVAM_API_KEY")
+    transcription = configured("GNANI_API_KEY") and configured("GNANI_STT_URL")
+    speech = configured("GNANI_API_KEY") and configured("GNANI_TTS_URL")
+    language_provider = configured("GEMINI_API_KEY") or configured("SARVAM_API_KEY")
+    return {
+        "ok": True,
+        "configured": transcription and speech and language_provider,
+        "providers": {name: configured(name) for name in provider_names},
+        "capabilities": {
+            "transcription": transcription,
+            "translation": language_provider,
+            "pronunciation": language_provider,
+            "bot_reply": language_provider,
+            "speech": speech,
+        },
+    }
 
 @app.post("/api/conversations/turn")
 async def turn(audio: UploadFile = File(...), speaker: str = Form(...), source_language: str = Form(...), source_style: str = Form(...), target_language: str = Form(...), target_style: str = Form(...)):
@@ -720,10 +755,14 @@ async def bot_reply(message: str = Form(...), style: str = Form(...), history: s
     sarvam_messages.append({"role": "user", "content": current_message})
     bot_reply_diagnostic("route", style, "request", history_entries=len(parsed), accepted_history_entries=accepted_history, message_length=len(current_message))
     deadline = time.monotonic() + BOT_REPLY_BUDGET_SECONDS
-    if not os.getenv("SARVAM_API_KEY"):
+    has_gemini = configured("GEMINI_API_KEY")
+    has_sarvam = configured("SARVAM_API_KEY")
+    if not has_gemini and not has_sarvam:
+        raise provider_configuration_error("AI Bot")
+    if has_gemini and not has_sarvam:
         reply = await resolve_bot_reply(await gemini(contents, bot_instruction(style), operation="reply", timeout=BOT_REPLY_TIMEOUT, max_output_tokens=512), style, provider="gemini", deadline=deadline)
     else:
-        primary = await gemini_bot_reply(contents, style, deadline)
+        primary = await gemini_bot_reply(contents, style, deadline) if has_gemini else None
         reply = primary if primary else await sarvam_bot_reply(sarvam_messages, style, deadline)
     bot_reply_diagnostic(reply.provider, style, "response", outcome="success", reply_length=len(reply.display), speech_length=len(reply.speech_text), speech_language=STYLE_LANGUAGE_CODES[style])
     return {"reply": reply.display, "speech_text": reply.speech_text, "speech_language": STYLE_LANGUAGE_CODES[style], "style": style, "provider": reply.provider}

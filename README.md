@@ -1,60 +1,49 @@
 # Language Friend
 
-## Run the frontend
+Language Friend is a React/Vite interface with a FastAPI voice and language-service backend. The existing Vercel configuration is unchanged; Docker Compose is a local, self-contained way to run the same app.
+
+## Run locally with Docker
+
+From the repository root, run:
 
 ```powershell
-npm.cmd install
-npm.cmd run dev
+docker compose up --build
 ```
 
-The Vite development server proxies `/api` calls to `http://127.0.0.1:8000`.
+Open [http://localhost:8080](http://localhost:8080) (the main screen redirects to Human Chat). The AI Bot is at [http://localhost:8080/ai](http://localhost:8080/ai). The frontend proxies `/api/*` to the internal `backend` Compose service, so the backend is not published to the host and browser code never receives provider credentials.
 
-## Run the voice backend
-
-Install Python 3.10+ first, then create `backend/.env` from `backend/.env.example` and provide:
-
-- `GNANI_API_KEY`, `GNANI_STT_URL`, and `GNANI_TTS_URL` from the Gnani account/API configuration
-- `GEMINI_API_KEY` from Google AI Studio / Gemini
-- optionally `GEMINI_MODEL` (defaults to `gemini-2.5-flash`)
-- optionally `FRONTEND_ORIGIN` (defaults to `http://localhost:5173`)
+To check the backend through that proxy:
 
 ```powershell
-cd backend
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-uvicorn main:app --reload --port 8000
+Invoke-WebRequest http://localhost:8080/api/health | Select-Object -Expand Content
 ```
 
-The app intentionally reports missing or rejected credentials and does not turn a failed live request into a sample result.
+Stop the stack with:
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
-
-Currently, two official plugins are available:
-
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
-
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
-
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+```powershell
+docker compose down
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+## Running without keys
+
+No `.env` file or provider key is required for the Compose stack to start. Human Chat, AI Bot, and Settings can all be opened. Live transcription, translation, AI replies, pronunciation conversion, and speech playback need their respective providers; an attempted unavailable feature shows its backend configuration message rather than a sample or simulated result. Only actual provider responses are rendered as translations or AI replies.
+
+## Optional provider setup
+
+Create an untracked root `.env` file before starting Compose, or set the same variables in your shell. These values are passed only to the backend container:
+
+```dotenv
+# At least one language provider enables live text translation, pronunciation, and AI Bot replies.
+GEMINI_API_KEY=...
+# or
+SARVAM_API_KEY=...
+
+# Gnani is required for microphone transcription and generated speech.
+GNANI_API_KEY=...
+GNANI_STT_URL=https://...
+GNANI_TTS_URL=https://...
+```
+
+`GEMINI_MODEL`, `SARVAM_CHAT_MODEL`, and the Sarvam endpoint override variables in `docker-compose.yml` are optional. When both Gemini and Sarvam are configured, Gemini is tried first and Sarvam remains a fallback; Sarvam can also operate by itself.
+
+`.dockerignore` files exclude `.env` files, virtual environments, dependency directories, generated output, recordings, logs, and other local artifacts from the respective image build contexts.

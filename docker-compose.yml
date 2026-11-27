@@ -1,0 +1,43 @@
+name: language-friend
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      FRONTEND_ORIGIN: http://localhost:8080
+      GNANI_API_KEY: ${GNANI_API_KEY:-}
+      GNANI_STT_URL: ${GNANI_STT_URL:-}
+      GNANI_TTS_URL: ${GNANI_TTS_URL:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
+      SARVAM_API_KEY: ${SARVAM_API_KEY:-}
+      SARVAM_TRANSLATE_URL: ${SARVAM_TRANSLATE_URL:-https://api.sarvam.ai/translate}
+      SARVAM_TRANSLITERATE_URL: ${SARVAM_TRANSLITERATE_URL:-https://api.sarvam.ai/transliterate}
+      SARVAM_CHAT_URL: ${SARVAM_CHAT_URL:-https://api.sarvam.ai/v2/chat/completions}
+      SARVAM_CHAT_MODEL: ${SARVAM_CHAT_MODEL:-glm5.3-flash}
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health').read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s

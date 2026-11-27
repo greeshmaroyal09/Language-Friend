@@ -14,6 +14,7 @@ type Delivery = {
   status: "pending" | "ready" | "failed";
   text?: string;
   speechText?: string;
+  error?: string;
 };
 type Turn = { id: string; source: Source; owner: Delivery; other?: Delivery };
 type HumanConversation = { partner: string | null; turns: Turn[]; capture?: Capture };
@@ -85,7 +86,7 @@ export default function HumanChat() {
         ...data,
         turns: data.turns.map((item) => item.id === turn.id ? { ...item, owner, other } : item),
       }));
-      const owner = { ...turn.owner, status: "pending" as const };
+      const owner = { ...turn.owner, status: "pending" as const, error: undefined };
       let other = turn.other;
       save(owner, other);
       try {
@@ -111,8 +112,12 @@ export default function HumanChat() {
           text = result.pronunciation;
         }
         if (!signal.aborted) save({ ...owner, status: "ready", text, speechText: other.speechText }, other);
-      } catch {
-        if (!signal.aborted) save({ ...owner, status: "failed" }, other);
+      } catch (cause) {
+        if (!signal.aborted) save({
+          ...owner,
+          status: "failed",
+          error: cause instanceof Error ? cause.message : "Translation unavailable.",
+        }, other);
       }
     });
   }
@@ -200,7 +205,7 @@ export default function HumanChat() {
           return <div className="human-turn" key={turn.id}>
             <Bubble side="owner" delivery={turn.owner} />
             {turn.owner.status !== "ready" && <div className="translation-retry" role="status">
-              {inFlight.has(turn.id) ? "Translating…" : <><span>Translation unavailable.</span><button type="button"
+              {inFlight.has(turn.id) ? "Translating…" : <><span>{turn.owner.error || "Translation unavailable."}</span><button type="button"
                 onClick={() => deliver(turn)}>Retry translation</button></>}
             </div>}
           </div>;
